@@ -46,3 +46,6 @@ Thumbs.db
 *.log
 token_test_results.json
 api/test_tokens.py
+
+# GitHub Actions workflow (needs PAT with "workflow" scope to push)
+.github/
