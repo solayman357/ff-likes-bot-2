@@ -1,0 +1,2 @@
+# Add your accounts here — one per line: uid:password
+# (the API service refreshes a fresh JWT for each account every 4 hours)

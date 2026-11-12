@@ -1,0 +1,5522 @@
+import os
+import json
+import base64
+import sys
+import threading
+import time
+import requests
+import aiohttp
+import asyncio
+from datetime import datetime, date, timedelta
+from datetime import time as datetime_time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler, ChatMemberHandler
+from telegram.request import HTTPXRequest
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
+
+# Protobuf imports (local copies for Render deployment)
+import uid_generator_pb2  # noqa: E402
+
+# Add parent directory to sys.path for github_persistence module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from github_persistence import init_github_persistence, get_github_persistence
+
+# ============ CONFIGURATION ============
+API_URL = os.getenv("API_URL", "http://127.0.0.1:5000")
+ENCODED_KEY = os.getenv("ENCODED_KEY", "U29sYXltYW4=")
+API_KEY = base64.b64decode(ENCODED_KEY).decode()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+# AES constants (must match api/app.py encrypt_message)
+MAIN_KEY = b'Yg&tc%DEuh6%Zc^8'
+MAIN_IV = b'6oyZDr22E3ychjM%'
+
+# ============ DATA FILES ============
+DATA_FILES = {
+    'allowed': 'allowed_groups.json',
+    'stats': 'daily_stats.json',
+    'users': 'user_limits.json',
+    'vip': 'vip_users.json',
+    'vip_limits': 'vip_limits.json',
+    'config': 'bot_config.json',
+    'lang': 'user_lang.json',
+    'history': 'like_history.json',
+    'uid_daily': 'user_uid_daily.json',
+}
+
+# Token upload: bot forwards tokens to API's /upload-tokens endpoint
+
+# ============ GROUP MANAGEMENT (SQLite) ============
+import sqlite3
+
+GROUP_DB_FILE = "group_management.db"
+GROUP_DB_LOCK = threading.Lock()
+
+
+def init_group_db():
+    """Initialize the SQLite group management database."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(GROUP_DB_FILE)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS groups (
+                    chat_id INTEGER PRIMARY KEY,
+                    chat_title TEXT,
+                    chat_username TEXT,
+                    chat_type TEXT,
+                    status TEXT DEFAULT 'allowed',
+                    added_at TEXT,
+                    updated_at TEXT,
+                    bot_member_status TEXT DEFAULT 'member',
+                    added_by INTEGER
+                )
+            """)
+            conn.commit()
+            conn.close()
+        print("✅ Group management SQLite DB initialized", flush=True)
+    except Exception as e:
+        print(f"⚠️ Group DB init failed: {e}", flush=True)
+
+
+def upsert_group(chat_id, chat_title=None, chat_username=None, chat_type=None,
+                 status=None, added_by=None, bot_member_status=None):
+    """Add or update a group in the SQLite database."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(GROUP_DB_FILE)
+            cur = conn.cursor()
+            now = datetime.now().isoformat()
+
+            # Check if group exists
+            cur.execute("SELECT chat_id, status, added_at FROM groups WHERE chat_id = ?", (chat_id,))
+            row = cur.fetchone()
+
+            if row is None:
+                # New group
+                cur.execute(
+                    "INSERT INTO groups (chat_id, chat_title, chat_username, chat_type, status, added_at, updated_at, bot_member_status, added_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (chat_id, chat_title, chat_username, chat_type,
+                     status or 'allowed', now, now, bot_member_status or 'member', added_by)
+                )
+            else:
+                # Update existing group - preserve added_at, only update fields provided
+                existing_status = row[1]
+                existing_added_at = row[2]
+                new_status = status if status is not None else existing_status
+                cur.execute(
+                    "UPDATE groups SET chat_title = COALESCE(?, chat_title), chat_username = COALESCE(?, chat_username), "
+                    "chat_type = COALESCE(?, chat_type), status = ?, updated_at = ?, "
+                    "bot_member_status = COALESCE(?, bot_member_status) WHERE chat_id = ?",
+                    (chat_title, chat_username, chat_type, new_status, now,
+                     bot_member_status, chat_id)
+                )
+                # Ensure added_at is preserved
+                cur.execute("UPDATE groups SET added_at = ? WHERE chat_id = ?", (existing_added_at, chat_id))
+
+            conn.commit()
+            conn.close()
+        # Queue for immediate GitHub sync
+        if github_persistence:
+            try:
+                github_persistence.queue_push('groups')
+            except Exception as e:
+                print(f"⚠️ GitHub queue failed for groups: {e}", flush=True)
+    except Exception as e:
+        print(f"⚠️ upsert_group failed: {e}", flush=True)
+
+
+def set_group_status(chat_id, status):
+    """Set the status (allowed/blocked/inactive) of a group."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(GROUP_DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE groups SET status = ?, updated_at = ? WHERE chat_id = ?",
+                (status, datetime.now().isoformat(), chat_id)
+            )
+            conn.commit()
+            changed = cur.rowcount > 0
+            conn.close()
+        # Queue for immediate GitHub sync
+        if github_persistence:
+            try:
+                github_persistence.queue_push('groups')
+            except Exception as e:
+                print(f"⚠️ GitHub queue failed for groups: {e}", flush=True)
+        return changed
+    except Exception as e:
+        print(f"⚠️ set_group_status failed: {e}", flush=True)
+        return False
+
+
+def get_all_groups():
+    """Get all groups from the database."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(GROUP_DB_FILE)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM groups ORDER BY added_at DESC")
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+        return rows
+    except Exception as e:
+        print(f"⚠️ get_all_groups failed: {e}", flush=True)
+        return []
+
+
+def get_group_count_by_status():
+    """Get counts of groups by status."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(GROUP_DB_FILE)
+            cur = conn.cursor()
+            cur.execute("SELECT status, COUNT(*) as cnt FROM groups GROUP BY status")
+            result = {}
+            for row in cur.fetchall():
+                result[row[0]] = row[1]
+            conn.close()
+        return result
+    except Exception as e:
+        print(f"⚠️ get_group_count_by_status failed: {e}", flush=True)
+        return {}
+
+
+def get_group_detail(chat_id):
+    """Get details of a single group."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(GROUP_DB_FILE)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM groups WHERE chat_id = ?", (chat_id,))
+            row = cur.fetchone()
+            conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"⚠️ get_group_detail failed: {e}", flush=True)
+        return None
+
+
+def is_group_allowed_db(chat_id, chat_type):
+    """Check if a group is allowed based on SQLite DB status."""
+    if chat_type == "private":
+        return True
+    if bot_mode == "public":
+        return True
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(GROUP_DB_FILE)
+            cur = conn.cursor()
+            cur.execute("SELECT status FROM groups WHERE chat_id = ?", (chat_id,))
+            row = cur.fetchone()
+            conn.close()
+        if row is None:
+            # Group not in DB - default to allowed if public mode
+            return bot_mode == "public"
+        return row[0] == 'allowed'
+    except Exception as e:
+        print(f"⚠️ is_group_allowed_db failed: {e}", flush=True)
+        return bot_mode == "public"
+
+
+def sync_groups_from_broadcast():
+    """Sync existing broadcast chats into the SQLite database.
+
+    Preserves existing ALLOWED/BLOCKED/INACTIVE status — does NOT overwrite
+    permissions. Only inserts new groups (defaulting to 'allowed') or updates
+    title/type fields for existing ones.
+    """
+    try:
+        data = _load_broadcast_data()
+        chats = data.get("chats", {})
+        count = 0
+        for cid, info in chats.items():
+            try:
+                chat_id = int(cid)
+            except (TypeError, ValueError):
+                continue
+            upsert_group(
+                chat_id=chat_id,
+                chat_title=info.get("title"),
+                chat_type=info.get("chat_type"),
+                # Do NOT pass status — preserve existing ALLOWED/BLOCKED/INACTIVE
+                bot_member_status='member'
+            )
+            count += 1
+        print(f"✅ Synced {count} groups from broadcast list to SQLite", flush=True)
+        return count
+    except Exception as e:
+        print(f"⚠️ sync_groups_from_broadcast failed: {e}", flush=True)
+        return 0
+# ============ AUTO LIKE SCHEDULER ============
+import zoneinfo
+
+try:
+    BD_TZ = zoneinfo.ZoneInfo("Asia/Dhaka")
+except Exception:
+    import pytz
+    BD_TZ = pytz.timezone("Asia/Dhaka")
+
+AUTO_LIKE_DB_FILE = GROUP_DB_FILE  # Same SQLite database
+AUTO_LIKE_LOCK = threading.Lock()
+AUTO_LIKE_SCHEDULER_TASK = None
+AUTO_LIKE_SCHEDULER_RUNNING = False
+
+# Broadcast destinations for auto like announcements
+AUTO_LIKE_BROADCAST_ENABLED = True
+AUTO_LIKE_CHANNEL_ID = None
+AUTO_LIKE_GROUP_ID = None
+AUTO_LIKE_CHANNEL_MSG_ID = None
+AUTO_LIKE_GROUP_MSG_ID = None
+
+# Admin configurable: max target likes per task
+MAX_AUTO_LIKE_TARGET = 100000
+
+
+def _persist_auto_like_db():
+    """Queue the SQLite DB for GitHub persistence after an auto-like change."""
+    if github_persistence:
+        try:
+            github_persistence.queue_push('groups')
+        except Exception as e:
+            print(f"⚠️ GitHub queue failed for auto-like DB: {e}", flush=True)
+
+
+def init_auto_like_db():
+    """Initialize the Auto Like scheduler tables in SQLite."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+
+            # Auto like tasks table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS auto_like_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_id INTEGER NOT NULL,
+                    owner_username TEXT,
+                    owner_name TEXT,
+                    uid INTEGER NOT NULL,
+                    region TEXT NOT NULL,
+                    target_likes INTEGER NOT NULL,
+                    delivered_likes INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'scheduled',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_executed TEXT,
+                    next_execution TEXT,
+                    channel_msg_id INTEGER,
+                    group_msg_id INTEGER,
+                    retry_count INTEGER DEFAULT 0,
+                    UNIQUE(owner_id, uid)
+                )
+            """)
+
+            # Migration for databases created before retry_count existed
+            try:
+                cur.execute("ALTER TABLE auto_like_tasks ADD COLUMN retry_count INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+            # Auto like execution history table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS auto_like_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    uid INTEGER NOT NULL,
+                    region TEXT NOT NULL,
+                    likes_delivered INTEGER NOT NULL,
+                    before_likes INTEGER,
+                    after_likes INTEGER,
+                    executed_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    FOREIGN KEY (task_id) REFERENCES auto_like_tasks(id)
+                )
+            """)
+
+            conn.commit()
+            conn.close()
+        print("✅ Auto Like scheduler DB initialized", flush=True)
+    except Exception as e:
+        print(f"⚠️ Auto Like DB init failed: {e}", flush=True)
+
+
+def upsert_auto_like_task(owner_id, owner_username, owner_name, uid, region,
+                          target_likes, status=None, delivered_likes=None,
+                          last_executed=None, next_execution=None,
+                          channel_msg_id=None, group_msg_id=None):
+    """Add or update an auto like task."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            now = datetime.now().isoformat()
+
+            cur.execute(
+                "SELECT id, delivered_likes, status, next_execution FROM auto_like_tasks "
+                "WHERE owner_id = ? AND uid = ?",
+                (owner_id, uid)
+            )
+            row = cur.fetchone()
+
+            if row is None:
+                # New task
+                task_id = cur.execute(
+                    "INSERT INTO auto_like_tasks "
+                    "(owner_id, owner_username, owner_name, uid, region, target_likes, "
+                    "delivered_likes, status, created_at, updated_at, last_executed, "
+                    "next_execution, channel_msg_id, group_msg_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (owner_id, owner_username, owner_name, uid, region,
+                     target_likes, delivered_likes or 0,
+                     status or 'scheduled', now, now,
+                     last_executed, next_execution,
+                     channel_msg_id, group_msg_id)
+                ).lastrowid
+            else:
+                task_id = row[0]
+                existing_delivered = row[1]
+                existing_status = row[2]
+                existing_next = row[3]
+
+                new_delivered = delivered_likes if delivered_likes is not None else existing_delivered
+                new_status = status if status is not None else existing_status
+                new_next = next_execution if next_execution is not None else existing_next
+
+                cur.execute(
+                    "UPDATE auto_like_tasks SET "
+                    "owner_username = COALESCE(?, owner_username), "
+                    "owner_name = COALESCE(?, owner_name), "
+                    "target_likes = COALESCE(?, target_likes), "
+                    "delivered_likes = ?, status = ?, updated_at = ?, "
+                    "last_executed = COALESCE(?, last_executed), "
+                    "next_execution = ?, "
+                    "channel_msg_id = COALESCE(?, channel_msg_id), "
+                    "group_msg_id = COALESCE(?, group_msg_id) "
+                    "WHERE id = ?",
+                    (owner_username, owner_name, target_likes,
+                     new_delivered, new_status, now,
+                     last_executed, new_next,
+                     channel_msg_id, group_msg_id, task_id)
+                )
+
+            conn.commit()
+            conn.close()
+        _persist_auto_like_db()
+        return task_id
+    except Exception as e:
+        print(f"⚠️ upsert_auto_like_task failed: {e}", flush=True)
+        return None
+
+
+def get_auto_like_tasks(owner_id=None, status=None):
+    """Get auto like tasks, optionally filtered by owner and/or status."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            if owner_id is not None and status is not None:
+                cur.execute(
+                    "SELECT * FROM auto_like_tasks WHERE owner_id = ? AND status = ? "
+                    "ORDER BY created_at DESC",
+                    (owner_id, status)
+                )
+            elif owner_id is not None:
+                cur.execute(
+                    "SELECT * FROM auto_like_tasks WHERE owner_id = ? "
+                    "ORDER BY created_at DESC",
+                    (owner_id,)
+                )
+            elif status is not None:
+                cur.execute(
+                    "SELECT * FROM auto_like_tasks WHERE status = ? "
+                    "ORDER BY created_at DESC",
+                    (status,)
+                )
+            else:
+                cur.execute("SELECT * FROM auto_like_tasks ORDER BY created_at DESC")
+
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+        return rows
+    except Exception as e:
+        print(f"⚠️ get_auto_like_tasks failed: {e}", flush=True)
+        return []
+
+
+def get_auto_like_task(task_id):
+    """Get a single auto like task by ID."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM auto_like_tasks WHERE id = ?", (task_id,))
+            row = cur.fetchone()
+            conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"⚠️ get_auto_like_task failed: {e}", flush=True)
+        return None
+
+
+def get_auto_like_task_by_uid(owner_id, uid):
+    """Get auto like task by owner and UID."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM auto_like_tasks WHERE owner_id = ? AND uid = ?",
+                (owner_id, uid)
+            )
+            row = cur.fetchone()
+            conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"⚠️ get_auto_like_task_by_uid failed: {e}", flush=True)
+        return None
+
+
+def is_uid_in_auto_like_tasks(uid) -> bool:
+    """True when this UID is registered in the Auto-Like list (any owner).
+
+    Completed tasks no longer block — the auto-like for that UID is finished.
+    If the check fails for any reason, return False so a normal /like is not
+    blocked by a database hiccup.
+    """
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM auto_like_tasks WHERE uid = ? AND status != 'completed'",
+                (int(uid),)
+            )
+            row = cur.fetchone()
+            conn.close()
+        return bool(row and row[0] > 0)
+    except Exception as e:
+        print(f"⚠️ is_uid_in_auto_like_tasks failed: {e}", flush=True)
+        return False
+
+
+def delete_auto_like_task(task_id):
+    """Permanently delete an auto like task from the database."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM auto_like_tasks WHERE id = ?", (task_id,))
+            conn.commit()
+            deleted = cur.rowcount > 0
+            conn.close()
+        return deleted
+    except Exception as e:
+        print(f"⚠️ delete_auto_like_task failed: {e}", flush=True)
+        return False
+
+
+def update_auto_like_task_progress(task_id, delivered_likes, status=None,
+                                    last_executed=None, next_execution=None,
+                                    retry_count=None):
+    """Update task progress after execution."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            now = datetime.now().isoformat()
+
+            cur.execute(
+                "SELECT delivered_likes FROM auto_like_tasks WHERE id = ?",
+                (task_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                conn.close()
+                return False
+
+            existing_delivered = row[0]
+            new_delivered = existing_delivered + delivered_likes
+
+            new_status = status if status is not None else 'scheduled'
+
+            cur.execute(
+                "UPDATE auto_like_tasks SET "
+                "delivered_likes = ?, status = ?, updated_at = ?, "
+                "last_executed = ?, next_execution = ?, "
+                "retry_count = COALESCE(?, retry_count) "
+                "WHERE id = ?",
+                (new_delivered, new_status, now,
+                 last_executed, next_execution, retry_count, task_id)
+            )
+            conn.commit()
+            conn.close()
+        _persist_auto_like_db()
+        return True
+    except Exception as e:
+        print(f"⚠️ update_auto_like_task_progress failed: {e}", flush=True)
+        return False
+
+
+def add_auto_like_history(task_id, owner_id, uid, region, likes_delivered,
+                          before_likes, after_likes, status, error_message=None):
+    """Add execution history record."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            now = datetime.now().isoformat()
+
+            cur.execute(
+                "INSERT INTO auto_like_history "
+                "(task_id, owner_id, uid, region, likes_delivered, "
+                "before_likes, after_likes, executed_at, status, error_message) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, owner_id, uid, region, likes_delivered,
+                 before_likes, after_likes, now, status, error_message)
+            )
+            conn.commit()
+            conn.close()
+        _persist_auto_like_db()
+    except Exception as e:
+        print(f"⚠️ add_auto_like_history failed: {e}", flush=True)
+
+
+def get_auto_like_history(task_id, limit=10):
+    """Get execution history for a task."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM auto_like_history WHERE task_id = ? "
+                "ORDER BY executed_at DESC LIMIT ?",
+                (task_id, limit)
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+        return rows
+    except Exception as e:
+        print(f"⚠️ get_auto_like_history failed: {e}", flush=True)
+        return []
+
+
+def get_due_auto_like_tasks():
+    """Get tasks that are due for execution (next_execution <= now)."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            now = datetime.now(BD_TZ).isoformat()
+            cur.execute(
+                "SELECT * FROM auto_like_tasks "
+                "WHERE status IN ('scheduled', 'resumed') "
+                "AND next_execution IS NOT NULL "
+                "AND next_execution <= ? "
+                "ORDER BY next_execution ASC",
+                (now,)
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+        return rows
+    except Exception as e:
+        print(f"⚠️ get_due_auto_like_tasks failed: {e}", flush=True)
+        return []
+
+
+def claim_auto_like_task(task_id):
+    """Atomically mark a due task as running so two runs cannot pick it up."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE auto_like_tasks SET status = 'running', updated_at = ? "
+                "WHERE id = ? AND status IN ('scheduled', 'resumed')",
+                (datetime.now().isoformat(), task_id)
+            )
+            conn.commit()
+            claimed = cur.rowcount > 0
+            conn.close()
+        return claimed
+    except Exception as e:
+        print(f"⚠️ claim_auto_like_task failed: {e}", flush=True)
+        return False
+
+
+def reset_stale_running_tasks():
+    """On startup return tasks stuck in 'running' (e.g. after a crash) to scheduled."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE auto_like_tasks SET status = 'scheduled' WHERE status = 'running'"
+            )
+            n = cur.rowcount
+            conn.commit()
+            conn.close()
+        if n:
+            print(f"♻️ Reset {n} stale running auto-like task(s)", flush=True)
+            _persist_auto_like_db()
+    except Exception as e:
+        print(f"⚠️ reset_stale_running_tasks failed: {e}", flush=True)
+
+
+def set_auto_like_task_status(task_id, status):
+    """Set task status (scheduled, running, paused, completed, failed, stopped)."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE auto_like_tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (status, datetime.now().isoformat(), task_id)
+            )
+            conn.commit()
+            changed = cur.rowcount > 0
+            conn.close()
+        if changed:
+            _persist_auto_like_db()
+        return changed
+    except Exception as e:
+        print(f"⚠️ set_auto_like_task_status failed: {e}", flush=True)
+        return False
+
+
+def get_auto_like_stats():
+    """Get overall statistics for all auto like tasks."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+
+            cur.execute("SELECT COUNT(*) FROM auto_like_tasks")
+            total = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM auto_like_tasks WHERE status = 'scheduled'")
+            scheduled = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM auto_like_tasks WHERE status = 'running'")
+            running = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM auto_like_tasks WHERE status = 'completed'")
+            completed = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM auto_like_tasks WHERE status = 'paused'")
+            paused = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM auto_like_tasks WHERE status = 'failed'")
+            failed = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM auto_like_tasks WHERE status = 'stopped'")
+            stopped = cur.fetchone()[0]
+
+            cur.execute("SELECT COALESCE(SUM(target_likes), 0) FROM auto_like_tasks")
+            total_target = cur.fetchone()[0]
+
+            cur.execute("SELECT COALESCE(SUM(delivered_likes), 0) FROM auto_like_tasks")
+            total_delivered = cur.fetchone()[0]
+
+            conn.close()
+
+        return {
+            'total': total,
+            'scheduled': scheduled,
+            'running': running,
+            'completed': completed,
+            'paused': paused,
+            'failed': failed,
+            'stopped': stopped,
+            'total_target': total_target,
+            'total_delivered': total_delivered,
+            'total_remaining': total_target - total_delivered,
+        }
+    except Exception as e:
+        print(f"⚠️ get_auto_like_stats failed: {e}", flush=True)
+        return {
+            'total': 0, 'scheduled': 0, 'running': 0, 'completed': 0,
+            'paused': 0, 'failed': 0, 'stopped': 0,
+            'total_target': 0, 'total_delivered': 0, 'total_remaining': 0,
+        }
+
+
+# ============ AUTO LIKE EXECUTION ============
+
+async def ensure_fresh_tokens():
+    """Make sure the API has at least one valid JWT before an auto-like run.
+
+    The API refreshes on startup, but Render's free instance may have been
+    asleep; a cold start + full refresh can take a couple of minutes. We poll
+    /refresh_status and trigger /refresh when the bank is empty.
+    """
+    base = API_URL.rstrip('/')
+    key = API_KEY
+    try:
+        status = None
+        for _ in range(3):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{base}/refresh_status?key={key}",
+                        timeout=aiohttp.ClientTimeout(total=90)
+                    ) as resp:
+                        if resp.status == 200:
+                            status = await resp.json()
+                            break
+            except Exception:
+                await asyncio.sleep(5)
+
+        valid = int((status or {}).get("valid_tokens_in_bank", 0) or 0)
+        running = bool((status or {}).get("refresh_running"))
+        if valid > 0 and not running:
+            return True
+
+        print(f"🔄 Auto like: token bank low (valid={valid}) - triggering refresh", flush=True)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{base}/refresh?key={key}",
+                    timeout=aiohttp.ClientTimeout(total=90)
+                ) as resp:
+                    await resp.read()
+        except Exception as e:
+            print(f"⚠️ Auto like: refresh trigger failed: {e}", flush=True)
+
+        # Wait up to ~4 minutes for the refresh to finish
+        for _ in range(24):
+            await asyncio.sleep(10)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{base}/refresh_status?key={key}",
+                        timeout=aiohttp.ClientTimeout(total=60)
+                    ) as resp:
+                        data = await resp.json()
+                if not data.get("refresh_running"):
+                    valid = int(data.get("valid_tokens_in_bank", 0) or 0)
+                    print(f"🔄 Auto like: token refresh finished (valid={valid})", flush=True)
+                    return valid > 0
+            except Exception:
+                pass
+        return False
+    except Exception as e:
+        print(f"⚠️ ensure_fresh_tokens error: {e}", flush=True)
+        return False
+
+
+def reschedule_auto_like_after_failure(task_id, retry_count):
+    """Back off after a failed attempt so we don't hammer the API every minute."""
+    now_bd = datetime.now(BD_TZ)
+    if retry_count >= 6:
+        next_exec = (now_bd + timedelta(days=1)).replace(
+            hour=4, minute=1, second=0, microsecond=0)
+        new_retry = 0
+    else:
+        next_exec = now_bd + timedelta(minutes=20)
+        new_retry = retry_count + 1
+    update_auto_like_task_progress(
+        task_id, 0, status='scheduled',
+        last_executed=now_bd.isoformat(),
+        next_execution=next_exec.isoformat(),
+        retry_count=new_retry,
+    )
+
+
+def _escape_html(value) -> str:
+    """Escape user/API supplied text for Telegram HTML parse mode."""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _escape_html(value) -> str:
+    """Escape user/API supplied text for Telegram HTML parse mode."""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+async def send_auto_like_report(region: str, uid, nickname: str,
+                                 likes_before: int, likes_added: int,
+                                 likes_after: int, target_likes: int,
+                                 total_sent: int, remaining_likes: int,
+                                 success: bool, error_msg: str = None,
+                                 level: str = "?",
+                                 bot_instance=None):
+    """Send a detailed auto-like report to BOTH @autolikespro group and @FFAUTOLIKESPRO1 channel.
+
+    This is called after EACH UID is processed in the auto-like scheduler.
+    Sends one report per UID immediately after processing.
+
+    Uses your exact stylized format with HTML parse mode + plain-text fallback
+    so reports never fail, even if Garena nicknames contain special characters.
+    """
+    bot = bot_instance or app_bot_instance
+    if bot is None:
+        print("⚠️ Auto-like report: bot instance not available", flush=True)
+        return
+
+    # BOTH destinations are mandatory. Merge in configured announcement
+    # targets as well, then de-duplicate by *resolved* chat ID so the same
+    # chat (e.g. "@autolikespro" and its numeric ID -1003951085541) is never
+    # posted to twice.
+    candidates = ["@autolikespro", "@FFAUTOLIKESPRO1",
+                  AUTO_LIKE_GROUP_ID, AUTO_LIKE_CHANNEL_ID]
+    destinations = []
+    seen_chat_ids = set()
+    for dest in candidates:
+        if dest in (None, ""):
+            continue
+        dedupe_key = str(dest)
+        try:
+            resolved = await bot.get_chat(dedupe_key)
+            dedupe_key = str(resolved.id)
+        except Exception:
+            pass
+        if dedupe_key in seen_chat_ids:
+            continue
+        seen_chat_ids.add(dedupe_key)
+        destinations.append(dest)
+
+    # Build the stylized report (your exact format)
+    full_uid = str(uid)
+    player = _escape_html(nickname or "Unknown")
+    server = _escape_html(region)
+    level_safe = _escape_html(str(level))
+    uid_safe = _escape_html(full_uid)
+    err_safe = _escape_html(error_msg[:200]) if error_msg else ""
+
+    if success:
+        header = "✅ Aᴜᴛᴏʟɪᴋᴇꜱ Sᴇɴᴛ Sᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ 🥳"
+    else:
+        header = "❌ Aᴜᴛᴏʟɪᴋᴇꜱ Fᴀɪʟᴇᴅ 💔"
+
+    sep = "━━━━━━━━━━━━━━━━━"
+
+    html_msg = (
+        f"{header}\n"
+        f"{sep}\n"
+        f"👤 Pʟᴀʏᴇʀ: {player}\n"
+        f"📊 Lᴇᴠᴇʟ: {level_safe}\n"
+        f"🌍 Rᴇɢɪᴏɴ: {server}\n"
+        f"🆔 UID: {uid_safe}\n"
+        f"📶 API Uꜱᴇᴅ: API 1\n"
+        f"❤️ Bᴇꜰᴏʀᴇ: {likes_before:,}\n"
+        f"💝 Aꜰᴛᴇʀ: {likes_after:,}\n"
+        f"🤖 Gɪᴠᴇɴ Bʏ Bᴏᴛ: {likes_added:,}\n"
+        f"{sep}\n"
+        f"📉 Rᴇᴍᴀɪɴɪɴɢ Tᴀʀɢᴇᴛ Lɪᴋᴇꜱ: {remaining_likes:,}/{target_likes:,} 💝"
+    )
+    if error_msg:
+        html_msg += f"\n⚠️ Eʀʀᴏʀ: {err_safe}"
+
+    # Plain-text version (always deliverable, no parse mode at all)
+    plain_msg = (
+        f"{header}\n"
+        f"{sep}\n"
+        f"👤 Pʟᴀʏᴇʀ: {nickname or 'Unknown'}\n"
+        f"📊 Lᴇᴠᴇʟ: {level}\n"
+        f"🌍 Rᴇɢɪᴏɴ: {region}\n"
+        f"🆔 UID: {full_uid}\n"
+        f"📶 API Uꜱᴇᴅ: API 1\n"
+        f"❤️ Bᴇꜰᴏʀᴇ: {likes_before:,}\n"
+        f"💝 Aꜰᴛᴇʀ: {likes_after:,}\n"
+        f"🤖 Gɪᴠᴇɴ Bʏ Bᴏᴛ: {likes_added:,}\n"
+        f"{sep}\n"
+        f"📉 Rᴇᴍᴀɪɴɪɴɢ Tᴀʀɢᴇᴛ Lɪᴋᴇꜱ: {remaining_likes:,}/{target_likes:,} 💝"
+    )
+    if error_msg:
+        plain_msg += f"\n⚠️ Eʀʀᴏʀ: {error_msg[:200]}"
+
+    for dest in destinations:
+        sent_ok = False
+        last_error = None
+
+        # Attempt 1: HTML (pretty), with retry
+        for attempt in range(3):
+            try:
+                await bot.send_message(chat_id=dest, text=html_msg,
+                                       parse_mode='HTML')
+                print(f"✅ Auto-like report sent to {dest} "
+                      f"(HTML, attempt {attempt + 1})", flush=True)
+                sent_ok = True
+                break
+            except Exception as e:
+                last_error = e
+                print(f"⚠️ Auto-like report attempt {attempt + 1} failed "
+                      f"for {dest}: {e}", flush=True)
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+
+        # Attempt 2: plain text fallback — must never be missed
+        if not sent_ok:
+            for attempt in range(3):
+                try:
+                    await bot.send_message(chat_id=dest, text=plain_msg)
+                    print(f"✅ Auto-like report sent to {dest} "
+                          f"(PLAIN fallback, attempt {attempt + 1})", flush=True)
+                    sent_ok = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    print(f"⚠️ Auto-like PLAIN fallback attempt {attempt + 1} "
+                          f"failed for {dest}: {e}", flush=True)
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+
+        if not sent_ok:
+            print(f"❌ Auto-like report FAILED for {dest} after all attempts: "
+                  f"{last_error}", flush=True)
+
+
+async def execute_auto_like_task(task):
+    """Execute a single auto like task via the existing API."""
+    task_id = task['id']
+    uid = task['uid']
+    region = task['region']
+    owner_id = task['owner_id']
+    target_likes = task['target_likes']
+    delivered_likes = task.get('delivered_likes', 0) or 0
+    retry_count = task.get('retry_count', 0) or 0
+
+    remaining = target_likes - delivered_likes
+    if remaining <= 0:
+        set_auto_like_task_status(task_id, 'completed')
+        return
+
+    # Determine how many tokens to request this time
+    # Cap at remaining to avoid exceeding target
+    tokens_to_request = min(remaining, 400)  # Max 400 per API request
+
+    try:
+        # Call the existing like API
+        result = await call_like_api(region, str(uid), tokens_to_request)
+
+        nickname = result.get('PlayerNickname') or 'Unknown' if result else 'Unknown'
+        level = result.get('Level', '?') if result else '?'
+
+        if result is None or result.get("error"):
+            error_msg = result.get("error", "Unknown error") if result else "No response"
+            add_auto_like_history(
+                task_id, owner_id, uid, region, 0,
+                0, 0, 'failed', error_msg
+            )
+            print(f"⚠️ Auto like task {task_id} failed: {error_msg}", flush=True)
+
+            # Send failure report to both destinations
+            await send_auto_like_report(
+                region=region, uid=uid, nickname=nickname,
+                likes_before=0, likes_added=0, likes_after=0,
+                target_likes=target_likes, total_sent=0,
+                remaining_likes=remaining, success=False,
+                error_msg=error_msg, level=level
+            )
+
+            reschedule_auto_like_after_failure(task_id, retry_count)
+            return
+
+        status = result.get('status')
+        likes_given = result.get('LikesGivenByAPI', 0) or 0
+        before = result.get('LikesbeforeCommand', 0) or 0
+        after = result.get('LikesafterCommand', 0) or 0
+
+        if status == 1:
+            # Successful likes
+            actual_given = likes_given if likes_given > 0 else (after - before if after > before else 0)
+            actual_given = max(0, min(actual_given, remaining))  # Cap at remaining
+
+            new_delivered = delivered_likes + actual_given
+            new_remaining = target_likes - new_delivered
+
+            if new_remaining <= 0:
+                next_exec = None
+                new_status = 'completed'
+            else:
+                next_exec = (datetime.now(BD_TZ) + timedelta(days=1)).replace(
+                    hour=4, minute=1, second=0, microsecond=0).isoformat()
+                new_status = 'scheduled'
+
+            # Update task progress (reset retry counter on success)
+            update_auto_like_task_progress(
+                task_id, actual_given,
+                status=new_status,
+                last_executed=datetime.now(BD_TZ).isoformat(),
+                next_execution=next_exec,
+                retry_count=0,
+            )
+
+            add_auto_like_history(
+                task_id, owner_id, uid, region, actual_given,
+                before, after, 'success'
+            )
+
+            print(f"✅ Auto like task {task_id}: +{actual_given} likes "
+                  f"({new_delivered}/{target_likes})", flush=True)
+
+            # Send detailed report to BOTH @autolikespro and @FFAUTOLIKESPRO1
+            await send_auto_like_report(
+                region=region, uid=uid, nickname=nickname,
+                likes_before=before, likes_added=actual_given,
+                likes_after=after, target_likes=target_likes,
+                total_sent=actual_given, remaining_likes=new_remaining,
+                success=True, level=level
+            )
+
+            # Announce progress
+            if AUTO_LIKE_BROADCAST_ENABLED:
+                await announce_auto_like_progress(
+                    task_id, owner_id, uid, region,
+                    actual_given, new_delivered, target_likes, new_remaining,
+                    status='progress' if new_remaining > 0 else 'completed'
+                )
+
+            if new_remaining <= 0:
+                set_auto_like_task_status(task_id, 'completed')
+        else:
+            # Status 2 - limit reached or other
+            add_auto_like_history(
+                task_id, owner_id, uid, region, 0,
+                before, after, 'failed',
+                f"API status {status}: Likes not given"
+            )
+            print(f"⚠️ Auto like task {task_id}: API status {status}, no likes given", flush=True)
+
+            # Send failure report to both destinations
+            await send_auto_like_report(
+                region=region, uid=uid, nickname=nickname,
+                likes_before=before, likes_added=0, likes_after=after,
+                target_likes=target_likes, total_sent=0,
+                remaining_likes=remaining, success=False,
+                error_msg=f"API status {status}: Likes not given", level=level
+            )
+
+            reschedule_auto_like_after_failure(task_id, retry_count)
+
+    except Exception as e:
+        print(f"⚠️ execute_auto_like_task {task_id} error: {e}", flush=True)
+        add_auto_like_history(
+            task_id, owner_id, uid, region, 0,
+            0, 0, 'failed', str(e)[:200]
+        )
+
+        # Send exception report to both destinations
+        await send_auto_like_report(
+            region=region, uid=uid, nickname='Unknown',
+            likes_before=0, likes_added=0, likes_after=0,
+            target_likes=target_likes, total_sent=0,
+            remaining_likes=remaining, success=False,
+            error_msg=str(e)[:200], level='?'
+        )
+
+        reschedule_auto_like_after_failure(task_id, retry_count)
+
+
+async def auto_like_scheduler_loop():
+    """Background scheduler loop - checks every minute for due tasks."""
+    global AUTO_LIKE_SCHEDULER_RUNNING
+    AUTO_LIKE_SCHEDULER_RUNNING = True
+
+    print("⏰ Auto Like scheduler started", flush=True)
+
+    while AUTO_LIKE_SCHEDULER_RUNNING:
+        try:
+            now_bd = datetime.now(BD_TZ)
+
+            # Check if it's 4:01 AM Bangladesh time
+            if now_bd.hour == 4 and now_bd.minute == 1:
+                tasks = get_due_auto_like_tasks()
+                for task in tasks:
+                    if not AUTO_LIKE_SCHEDULER_RUNNING:
+                        break
+                    await execute_auto_like_task(task)
+
+            # Sleep 60 seconds before next check
+            await asyncio.sleep(60)
+        except Exception as e:
+            print(f"⚠️ Auto like scheduler error: {e}", flush=True)
+            await asyncio.sleep(60)
+
+
+def start_auto_like_scheduler():
+    """Start the auto like scheduler background task."""
+    global AUTO_LIKE_SCHEDULER_TASK, AUTO_LIKE_SCHEDULER_RUNNING
+    if AUTO_LIKE_SCHEDULER_TASK is None or AUTO_LIKE_SCHEDULER_TASK.done():
+        AUTO_LIKE_SCHEDULER_RUNNING = True
+        AUTO_LIKE_SCHEDULER_TASK = asyncio.create_task(auto_like_scheduler_loop())
+        print("🚀 Auto Like scheduler task created", flush=True)
+
+
+def stop_auto_like_scheduler():
+    """Stop the auto like scheduler."""
+    global AUTO_LIKE_SCHEDULER_RUNNING
+    AUTO_LIKE_SCHEDULER_RUNNING = False
+    if AUTO_LIKE_SCHEDULER_TASK and not AUTO_LIKE_SCHEDULER_TASK.done():
+        AUTO_LIKE_SCHEDULER_TASK.cancel()
+        print("🛑 Auto Like scheduler stopped", flush=True)
+
+
+# Global reference to the Telegram Application for announcements
+app_bot_instance = None
+
+
+def set_app_bot(app_instance):
+    """Store the Bot used for announcements.
+
+    Must be the Bot, not the Application: Application has no send_message /
+    edit_message_text / get_chat, so reports silently failed with
+    AttributeError when the Application was stored here.
+    """
+    global app_bot_instance
+    app_bot_instance = getattr(app_instance, "bot", app_instance)
+
+
+async def announce_auto_like_created(task, bot_instance=None):
+    """Announce a new auto like task to channel and group."""
+    if not AUTO_LIKE_BROADCAST_ENABLED:
+        return
+
+    bot = bot_instance or app_bot_instance
+    if bot is None:
+        return
+
+    uid = task['uid']
+    region = task['region']
+    target = task['target_likes']
+    delivered = task.get('delivered_likes', 0) or 0
+    remaining = target - delivered
+    pct = (delivered / target * 100) if target > 0 else 0
+
+    msg = (
+        "🔥 *AUTO LIKE ACTIVATED*\n\n"
+        f"👤 UID: `{uid}`\n"
+        f"🌍 Region: {region}\n"
+        f"🎯 Target: {target:,} Likes\n"
+        f"❤️ Delivered: {delivered:,}\n"
+        f"📉 Remaining: {remaining:,}\n"
+        f"📊 Progress: {pct:.1f}%\n"
+        f"⏰ Schedule: Daily 04:01 AM\n"
+        f"🇧🇩 Timezone: Bangladesh\n"
+        f"🟢 Status: SCHEDULED"
+    )
+
+    await _send_announcement(bot, msg, task['id'], update_existing=False)
+
+
+async def announce_auto_like_progress(task_id, owner_id, uid, region,
+                                       likes_delivered, total_delivered,
+                                       target_likes, remaining, status,
+                                       bot_instance=None):
+    """Update progress announcement in channel and group."""
+    if not AUTO_LIKE_BROADCAST_ENABLED:
+        return
+
+    bot = bot_instance or app_bot_instance
+    if bot is None:
+        return
+
+    pct = (total_delivered / target_likes * 100) if target_likes > 0 else 0
+    bar_length = 20
+    filled = int(bar_length * total_delivered / target_likes) if target_likes > 0 else 0
+    bar = "█" * filled + "░" * (bar_length - filled)
+
+    status_emoji = {
+        'progress': '🔄',
+        'completed': '🎉',
+        'failed': '❌',
+        'paused': '⏸️',
+    }.get(status, '🔄')
+
+    status_text = {
+        'progress': 'PROGRESS',
+        'completed': 'COMPLETED',
+        'failed': 'FAILED',
+        'paused': 'PAUSED',
+    }.get(status, 'PROGRESS')
+
+    msg = (
+        f"{status_emoji} <b>AUTO LIKE {status_text}</b>\n\n"
+        f"👤 UID: <code>{_escape_html(uid)}</code>\n"
+        f"🌍 Region: {_escape_html(region)}\n"
+        f"🎯 Target: {target_likes:,} Likes\n"
+        f"❤️ Delivered: {total_delivered:,}\n"
+        f"📉 Remaining: {remaining:,}\n"
+        f"📊 Progress: {pct:.1f}%\n"
+        f"{bar}\n"
+        f"🟢 Status: {status_text}"
+    )
+
+    await _send_announcement(bot, msg, task_id, update_existing=True)
+
+
+async def announce_auto_like_completed(task, bot_instance=None):
+    """Announce completion of auto like task."""
+    if not AUTO_LIKE_BROADCAST_ENABLED:
+        return
+
+    bot = bot_instance or app_bot_instance
+    if bot is None:
+        return
+
+    uid = task['uid']
+    region = task['region']
+    target = task['target_likes']
+    delivered = task.get('delivered_likes', 0) or 0
+
+    msg = (
+        "🎉 <b>AUTO LIKE COMPLETED!</b>\n\n"
+        f"👤 UID: <code>{_escape_html(uid)}</code>\n"
+        f"🌍 Region: {_escape_html(region)}\n"
+        f"🎯 Target: {target:,} Likes\n"
+        f"❤️ Successfully Delivered: {delivered:,}\n"
+        f"🟢 Status: AUTOMATICALLY DISABLED"
+    )
+
+    await _send_announcement(bot, msg, task['id'], update_existing=False)
+
+
+async def _send_announcement(bot, text, task_id, update_existing=False):
+    """Send or update announcement in channel and group."""
+    global AUTO_LIKE_CHANNEL_ID, AUTO_LIKE_GROUP_ID
+
+    task = get_auto_like_task(task_id)
+    if task is None:
+        return
+
+    channel_msg_id = task.get('channel_msg_id')
+    group_msg_id = task.get('group_msg_id')
+
+    targets = []
+    if AUTO_LIKE_CHANNEL_ID:
+        targets.append(('channel', AUTO_LIKE_CHANNEL_ID, channel_msg_id))
+    if AUTO_LIKE_GROUP_ID:
+        targets.append(('group', AUTO_LIKE_GROUP_ID, group_msg_id))
+
+    if not targets:
+        return
+
+    def _store_msg_id(ttype, mid):
+        col = 'channel_msg_id' if ttype == 'channel' else 'group_msg_id'
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE auto_like_tasks SET {col} = ? WHERE id = ?",
+                (mid, task_id)
+            )
+            conn.commit()
+            conn.close()
+
+    for target_type, chat_id, msg_id in targets:
+        sent = None
+
+        # 1) Try to edit the existing announcement (progress updates)
+        if update_existing and msg_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id, text=text,
+                    parse_mode='HTML'
+                )
+                continue
+            except Exception as e:
+                print(f"⚠️ Announcement edit failed for {target_type} "
+                      f"({chat_id}): {e}", flush=True)
+
+        # 2) Send a fresh announcement (HTML)
+        for attempt in range(3):
+            try:
+                sent = await bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode='HTML'
+                )
+                break
+            except Exception as e:
+                print(f"⚠️ Announcement HTML send attempt {attempt + 1} failed "
+                      f"for {target_type} ({chat_id}): {e}", flush=True)
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+
+        # 3) Plain-text fallback so an announcement is never missed
+        if sent is None:
+            plain = (text.replace('<b>', '').replace('</b>', '')
+                         .replace('<code>', '').replace('</code>', ''))
+            plain = (plain.replace('&lt;', '<').replace('&gt;', '>')
+                          .replace('&amp;', '&'))
+            for attempt in range(3):
+                try:
+                    sent = await bot.send_message(chat_id=chat_id, text=plain)
+                    break
+                except Exception as e:
+                    print(f"⚠️ Announcement PLAIN send attempt {attempt + 1} "
+                          f"failed for {target_type} ({chat_id}): {e}", flush=True)
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+
+        if sent:
+            try:
+                _store_msg_id(target_type, sent.message_id)
+            except Exception as e:
+                print(f"⚠️ Could not store message id for {target_type}: {e}",
+                      flush=True)
+        else:
+            print(f"❌ Announcement FAILED for {target_type} ({chat_id})",
+                  flush=True)
+
+
+forward_channel_ids = ["@autolikespro", "@FFAUTOLIKESPRO1"]       # List of channel IDs to forward successful likes to
+forward_channel_links = {}     # Map: channel_id -> invite link
+
+# Bot state globals (initialized before load_data)
+bot_status = "on"
+bot_mode = "public"
+allowed_groups = {}
+daily_stats = {}
+user_limits = {}
+user_cooldowns = {}  # {user_id: timestamp} cooldown tracking
+vip_users = set()
+vip_limits = {"default": 0, "users": {}}  # VIP daily like limits (0 = unlimited)
+user_lang = {}  # {user_id: "en" or "bn"}
+user_uid_daily = {}  # {uid: date_str} - GLOBAL per-UID per-day lock (claimed by any normal user)
+uid_daily_lock = threading.Lock()  # Atomic access to user_uid_daily
+daily_limit = 2
+like_tokens = 240
+force_join = False
+force_join_channels = []  # List of group chat ID strings: ["-1001234567890", ...]
+force_join_links = {}  # Dict: group_id → invite_link
+force_join_group_titles = {}  # Dict: group_id → group title
+force_join_group_usernames = {}  # Dict: group_id → @username
+_ff_migration_done = False  # Flag to track one-time migration of invite hash IDs
+welcome_msg = "👋 Welcome to FF LIKES PRO BOT! Use /help to see all commands."
+goodbye_msg = "👋 Goodbye! Come back soon to FF LIKES PRO BOT."
+
+# GitHub persistence
+github_persistence = None
+
+# ============ HELPER FUNCTIONS ============
+def _read_json(path, default):
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def load_data():
+    """Load persisted data. GitHub is the source of truth when enabled."""
+    global allowed_groups, daily_stats, user_limits, bot_status, bot_mode, daily_limit, like_tokens, force_join, force_join_channels, force_join_links, force_join_group_titles, force_join_group_usernames, forward_channel_ids, forward_channel_links, forward_channel_id, forward_channel_link, AUTO_LIKE_CHANNEL_ID, AUTO_LIKE_GROUP_ID, user_uid_daily, vip_limits
+
+    if github_persistence:
+        try:
+            restored = github_persistence.pull_latest()
+            print(f"☁️ GitHub restore: {restored} file(s) pulled", flush=True)
+        except Exception as e:
+            print(f"⚠️ GitHub restore failed, using local files: {e}", flush=True)
+
+    allowed_groups = _read_json(DATA_FILES['allowed'], {})
+    daily_stats = _read_json(DATA_FILES['stats'], {})
+    user_limits = _read_json(DATA_FILES['users'], {})
+    vip_users = set(_read_json(DATA_FILES['vip'], []))
+    _vl = _read_json(DATA_FILES['vip_limits'], {})
+    if not isinstance(_vl, dict):
+        _vl = {}
+    vip_limits = {
+        "default": int(_vl.get("default", 0) or 0),
+        "users": {str(k): int(v or 0) for k, v in (_vl.get("users", {}) or {}).items()},
+    }
+    user_lang = {int(k): v for k, v in _read_json(DATA_FILES['lang'], {}).items()}
+    user_uid_daily = _read_json(DATA_FILES['uid_daily'], {})
+    # Migrate old format {user_id: {uid: date}} to new format {uid: date}
+    migrated = {}
+    if isinstance(user_uid_daily, dict):
+        for k, v in user_uid_daily.items():
+            if isinstance(v, dict):
+                # Old format: {user_id: {uid: date}} - flatten to {uid: date}
+                for uid, d in v.items():
+                    if isinstance(d, str):
+                        migrated[uid] = d
+            elif isinstance(v, str):
+                # Already new format: {uid: date}
+                migrated[k] = v
+    user_uid_daily = migrated
+    cfg = _read_json(DATA_FILES['config'], None)
+    AUTO_LIKE_CHANNEL_ID = cfg.get('auto_like_channel_id') if isinstance(cfg, dict) else None
+    AUTO_LIKE_GROUP_ID = cfg.get('auto_like_group_id') if isinstance(cfg, dict) else None
+    if AUTO_LIKE_CHANNEL_ID:
+        print(f"📺 Auto-like announcement channel loaded: {AUTO_LIKE_CHANNEL_ID}", flush=True)
+    if AUTO_LIKE_GROUP_ID:
+        print(f"👥 Auto-like announcement group loaded: {AUTO_LIKE_GROUP_ID}", flush=True)
+
+    # Apply saved values WITHOUT resetting anything to defaults.
+    if isinstance(cfg, dict):
+        bot_status = cfg.get('status', bot_status)
+        bot_mode = cfg.get('mode', bot_mode)
+        try:
+            daily_limit = int(cfg.get('limit', daily_limit))
+        except Exception:
+            pass
+        try:
+            like_tokens = int(cfg.get('like_tokens', like_tokens))
+        except Exception:
+            pass
+        force_join = bool(cfg.get('force_join', force_join))
+        force_join_channels = list(cfg.get('force_join_channels', force_join_channels) or [])
+        force_join_links = dict(cfg.get('force_join_links', force_join_links) or {})
+        force_join_group_titles = dict(cfg.get('force_join_group_titles', force_join_group_titles) or {})
+        force_join_group_usernames = dict(cfg.get('force_join_group_usernames', force_join_group_usernames) or {})
+        forward_channel_ids = list(cfg.get('forward_channel_ids') or [])
+        forward_channel_links = dict(cfg.get('forward_channel_links') or {})
+
+        # Auto-enable force join if channels are configured (even if flag is False)
+        if force_join_channels and not force_join:
+            force_join = True
+            print(f"🔒 Force join auto-enabled: {len(force_join_channels)} group(s) configured", flush=True)
+
+        # Backward compatibility: if forward_channel_ids is empty but forward_channel_id exists,
+        # migrate the single value to the list
+        if not forward_channel_ids:
+            old_single = cfg.get('forward_channel_id', '')
+            if old_single:
+                forward_channel_ids = [old_single]
+                print(f"🔄 Migrated forward_channel_id '{old_single}' to forward_channel_ids list", flush=True)
+
+        # Never let an empty persisted config silently disable forwarding.
+        # (The bot-data branch previously stored forward_channel_ids: [].)
+        DEFAULT_FORWARD_IDS = ["@autolikespro", "@FFAUTOLIKESPRO1"]
+        if not forward_channel_ids:
+            forward_channel_ids = list(DEFAULT_FORWARD_IDS)
+            print("🛟 forward_channel_ids was empty in config - restored defaults", flush=True)
+        for _cid in DEFAULT_FORWARD_IDS:
+            forward_channel_links.setdefault(_cid, f"https://t.me/{_cid.lstrip('@')}")
+
+    # Migrate stored force-join channel identifiers (e.g. "channel-1" -> "@FFLIKESPRO2")
+    try:
+        _migrate_force_join_channels()
+    except Exception as e:
+        print(f"⚠️ Force-join migration failed: {e}", flush=True)
+
+    # First run with persistence enabled: upload existing settings instead of
+    # replacing them with defaults.
+    if github_persistence:
+        try:
+            seeded = github_persistence.seed_missing()
+            if seeded:
+                print(f"☁️ GitHub seed: {seeded} file(s) uploaded", flush=True)
+        except Exception as e:
+            print(f"⚠️ GitHub seed failed: {e}", flush=True)
+
+    print(f"⚙️ Loaded settings: status={bot_status} mode={bot_mode} "
+          f"limit={daily_limit} like_tokens={like_tokens} "
+          f"force_join={force_join} channels={len(force_join_channels)}", flush=True)
+
+    # Initialize group management SQLite DB and sync existing broadcast groups
+    try:
+        init_group_db()
+        synced = sync_groups_from_broadcast()
+        if synced:
+            print(f"📦 Group DB: {synced} group(s) synced from broadcast list", flush=True)
+    except Exception as e:
+        print(f"⚠️ Group DB init/sync failed: {e}", flush=True)
+
+
+def _save_successful_likes():
+    """No-op placeholder — successful likes are saved immediately by log_successful_like()."""
+    pass
+
+
+def save_all():
+    try:
+        with open(DATA_FILES['allowed'], 'w') as f: json.dump(allowed_groups, f, indent=2)
+        with open(DATA_FILES['stats'], 'w') as f: json.dump(daily_stats, f, indent=2)
+        with open(DATA_FILES['users'], 'w') as f: json.dump(user_limits, f, indent=2)
+        with open(DATA_FILES['vip'], 'w') as f: json.dump(sorted(list(vip_users)), f, indent=2)
+        with open(DATA_FILES['vip_limits'], 'w') as f:
+            json.dump({
+                "default": int(vip_limits.get("default", 0) or 0),
+                "users": {str(k): int(v or 0) for k, v in (vip_limits.get("users", {}) or {}).items()},
+            }, f, indent=2)
+        with open(DATA_FILES['lang'], 'w') as f: json.dump({str(k): v for k, v in user_lang.items()}, f, indent=2)
+        with open(DATA_FILES['uid_daily'], 'w') as f: json.dump(user_uid_daily, f, indent=2)
+        with open(DATA_FILES['history'], 'w') as f: json.dump({}, f, indent=2)  # history appended in log_successful_like
+        with open(DATA_FILES['config'], 'w') as f:
+            json.dump({
+                'status': bot_status,
+                'mode': bot_mode,
+                'limit': daily_limit,
+                'like_tokens': like_tokens,
+                'force_join': force_join,
+                'force_join_channels': force_join_channels,
+                'force_join_links': force_join_links,
+                'force_join_group_titles': force_join_group_titles,
+                'force_join_group_usernames': force_join_group_usernames,
+                'forward_channel_ids': forward_channel_ids,
+                'forward_channel_links': forward_channel_links,
+                # Backward compatibility: also save single value
+                'forward_channel_id': forward_channel_ids[0] if forward_channel_ids else '',
+                'forward_channel_link': forward_channel_links.get(forward_channel_ids[0], '') if forward_channel_ids else '',
+                'auto_like_channel_id': AUTO_LIKE_CHANNEL_ID,
+                'auto_like_group_id': AUTO_LIKE_GROUP_ID,
+            }, f, indent=2)
+        # Save broadcast list
+        try:
+            with open(BROADCAST_FILE, 'w') as f:
+                json.dump(_load_broadcast_data(), f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠️ save_all broadcast write failed: {e}", flush=True)
+        # Save successful likes log
+        try:
+            _save_successful_likes()
+        except Exception as e:
+            print(f"⚠️ save_all likes write failed: {e}", flush=True)
+    except Exception as e:
+        print(f"⚠️ save_all local write failed: {e}", flush=True)
+
+    # Queue for GitHub sync (background, retried, never blocks the bot).
+    if github_persistence:
+        for key in ('allowed', 'stats', 'users', 'config', 'groups', 'broadcast', 'likes', 'lang', 'history', 'uid_daily', 'vip', 'vip_limits'):
+            try:
+                github_persistence.queue_push(key)
+            except Exception as e:
+                print(f"⚠️ GitHub queue failed for {key}: {e}", flush=True)
+
+FORCE_JOIN_TEXT = (
+    "🔒 *JOIN ALL REQUIRED GROUPS*\n\n"
+    "To use FF LIKES PRO, please join every group below.\n\n"
+    "1️⃣ Tap each button and join\n"
+    "2️⃣ Come back and tap ✅ I'VE JOINED - VERIFY"
+)
+
+
+def _md_escape(text: str) -> str:
+    """Escape Telegram legacy-Markdown special characters."""
+    return re.sub(r'([_*`\[])', r'\\\1', str(text))
+
+
+def _force_join_title(ch) -> str:
+    """Friendly title for a force-join group id."""
+    ch = str(ch)
+    return force_join_group_titles.get(ch) or force_join_group_usernames.get(ch) or ch
+
+
+def build_force_join_text(missing) -> str:
+    """Block text listing ONLY the groups the user has not joined yet."""
+    if not missing:
+        return FORCE_JOIN_TEXT
+    lines = "\n".join(
+        f"• {_md_escape(_force_join_title(ch))}" for ch in missing
+    )
+    n = len(missing)
+    return (
+        "🔒 *JOIN REQUIRED GROUPS*\n\n"
+        f"You haven't joined *{n}* group{'s' if n != 1 else ''} yet:\n\n"
+        f"{lines}\n\n"
+        "1️⃣ Tap each button and join\n"
+        "2️⃣ Come back and tap ✅ I'VE JOINED - VERIFY"
+    )
+
+
+def build_force_join_keyboard(channels=None) -> InlineKeyboardMarkup:
+    """One URL button per NOT-yet-joined group, then the verify button.
+
+    `channels` defaults to all configured groups; pass the missing subset
+    so users only see buttons for groups they still need to join.
+    """
+    if channels is None:
+        channels = force_join_channels
+    keyboard = []
+    for i, gid in enumerate(channels, start=1):
+        link = (force_join_links.get(gid) or "").strip()
+        title = str(_force_join_title(gid))[:48]
+        if link:
+            keyboard.append([InlineKeyboardButton(f"📢 {i}. {title}", url=link)])
+        else:
+            keyboard.append([InlineKeyboardButton(f"⚠️ {i}. {title} (no link)", callback_data="forcejoin_noop")])
+    keyboard.append([InlineKeyboardButton("✅ I'VE JOINED - VERIFY", callback_data="verify_join")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _member_is_joined(member) -> bool:
+    """Accept member/admin/creator, and restricted users who are still members."""
+    status = getattr(member, "status", "")
+    status = getattr(status, "value", status)  # enum -> str
+    if status in ("member", "administrator", "creator"):
+        return True
+    if status == "restricted" and getattr(member, "is_member", False):
+        return True
+    return False
+
+
+async def safe_edit_message(target, text: str, reply_markup=None, parse_mode: str = 'Markdown') -> bool:
+    """Edit a message safely. Returns True if edited, or if content was unchanged ('not modified').
+
+    Never raises — swallows 'Message is not modified' so tapping Verify again
+    with the same result never crashes the handler.
+    """
+    try:
+        await target.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return True
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return True  # Same content as before — that's fine
+        print(f"⚠️ Edit message BadRequest: {e}", flush=True)
+        return False
+    except Exception as e:
+        print(f"⚠️ Edit message error: {e}", flush=True)
+        return False
+
+
+async def is_user_member_single(context: ContextTypes.DEFAULT_TYPE, user_id: int, channel: str) -> bool:
+    """Check membership in one channel. Returns True only if truly joined.
+
+    Tries the stored channel identifier first. If that fails (e.g. invite hash
+    that can't be used with get_chat_member), resolves the invite link to a real
+    chat ID via get_chat and retries.
+    If get_chat_member fails for any reason (bot not admin, channel deleted,
+    etc.), we treat the user as NOT joined to maintain security.
+    """
+    # Try the stored channel identifier first
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+        joined = _member_is_joined(member)
+        if not joined:
+            print(f"🔍 getChatMember '{channel}' user={user_id}: status={getattr(member, 'status', '?')} → NOT joined", flush=True)
+        return joined
+    except BadRequest as e:
+        msg = str(e).lower()
+        # If chat not found or bad request, try resolving via invite link
+        if "chat not found" in msg or "bad request" in msg:
+            link = force_join_links.get(str(channel), "") or ""
+            if link and link.startswith("https://t.me/"):
+                try:
+                    # Resolve invite link to real chat ID via get_chat
+                    chat_info = await context.bot.get_chat(chat_id=link)
+                    real_chat_id = str(chat_info.id)
+                    print(f"🔄 Resolved invite link '{link}' to chat ID '{real_chat_id}'", flush=True)
+                    # Update stored channel ID to the real chat ID
+                    if channel in force_join_channels:
+                        idx = force_join_channels.index(channel)
+                        force_join_channels[idx] = real_chat_id
+                        force_join_links[real_chat_id] = force_join_links.pop(channel)
+                        force_join_group_titles[real_chat_id] = force_join_group_titles.pop(channel, real_chat_id)
+                        if channel in force_join_group_usernames:
+                            force_join_group_usernames[real_chat_id] = force_join_group_usernames.pop(channel)
+                    member = await context.bot.get_chat_member(chat_id=real_chat_id, user_id=user_id)
+                    joined = _member_is_joined(member)
+                    if not joined:
+                        print(f"🔍 getChatMember '{real_chat_id}' user={user_id}: status={getattr(member, 'status', '?')} → NOT joined", flush=True)
+                    return joined
+                except Exception as e2:
+                    print(f"⚠️ Could not resolve invite link '{link}': {type(e2).__name__}: {e2}", flush=True)
+                    return False  # Can't verify, treat as NOT joined
+        print(f"⚠️ getChatMember '{channel}' failed: {e}", flush=True)
+        return False  # Can't verify, treat as NOT joined
+    except Exception as e:
+        print(f"⚠️ getChatMember '{channel}' failed: {type(e).__name__}: {e}", flush=True)
+        return False  # Can't verify, treat as NOT joined
+
+
+async def get_missing_channels(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Return the list of required channels the user has NOT joined."""
+    missing = []
+    for channel in force_join_channels:
+        if not await is_user_member_single(context, user_id, channel):
+            missing.append(channel)
+    return missing
+
+
+async def is_user_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """True only when the user is a member of EVERY required channel."""
+    if not force_join or not force_join_channels:
+        return True
+    return len(await get_missing_channels(context, user_id)) == 0
+
+
+async def _migrate_force_join_ids(context: ContextTypes.DEFAULT_TYPE):
+    """Resolve any invite hash IDs in force_join_channels to real chat IDs.
+
+    Invite hashes (e.g. +SoEwO6_27x05Y2M1) cannot be used with get_chat_member.
+    This function tries to resolve them via get_chat(chat_id=invite_link).
+    """
+    global force_join_channels, force_join_links, force_join_group_titles, force_join_group_usernames
+    global _ff_migration_done
+
+    if _ff_migration_done:
+        return
+
+    _ff_migration_done = True
+
+    if not force_join_channels:
+        return
+
+    new_channels = []
+    new_links = {}
+    new_titles = {}
+    new_usernames = {}
+    migrated = False
+
+    for gid in force_join_channels:
+        link = force_join_links.get(gid, "") or ""
+
+        # If gid is already a real chat ID (starts with - or @), keep as-is
+        if gid.startswith("-") or gid.startswith("@"):
+            new_channels.append(gid)
+            if link:
+                new_links[gid] = link
+            if gid in force_join_group_titles:
+                new_titles[gid] = force_join_group_titles[gid]
+            if gid in force_join_group_usernames:
+                new_usernames[gid] = force_join_group_usernames[gid]
+            continue
+
+        # gid is an invite hash (e.g. +SoEwO6_27x05Y2M1) - try to resolve
+        if gid.startswith("+"):
+            invite_link = f"https://t.me/{gid}"
+        else:
+            invite_link = link if link else f"https://t.me/{gid}"
+
+        try:
+            chat_info = await context.bot.get_chat(chat_id=invite_link)
+            real_gid = str(chat_info.id)
+            real_title = getattr(chat_info, "title", None) or gid
+            real_username = getattr(chat_info, "username", None)
+            if real_username and not real_username.startswith("@"):
+                real_username = "@" + real_username
+
+            print(f"🔄 Resolved invite hash '{gid}' to chat ID '{real_gid}'", flush=True)
+
+            new_channels.append(real_gid)
+            new_links[real_gid] = invite_link
+            new_titles[real_gid] = real_title
+            new_usernames[real_gid] = real_username
+            migrated = True
+        except Exception as e:
+            print(f"⚠️ Could not resolve invite hash '{gid}': {e}", flush=True)
+            # Keep as-is; verification will fail but at least we tried
+            new_channels.append(gid)
+            if link:
+                new_links[gid] = link
+            if gid in force_join_group_titles:
+                new_titles[gid] = force_join_group_titles[gid]
+            if gid in force_join_group_usernames:
+                new_usernames[gid] = force_join_group_usernames[gid]
+
+    if migrated:
+        force_join_channels.clear()
+        force_join_channels.extend(new_channels)
+        force_join_links.clear()
+        force_join_links.update(new_links)
+        force_join_group_titles.clear()
+        force_join_group_titles.update(new_titles)
+        force_join_group_usernames.clear()
+        force_join_group_usernames.update(new_usernames)
+        save_all()
+        print(f"✅ Force-join migration complete: {len(force_join_channels)} group(s) resolved", flush=True)
+
+
+async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Block access until the user has joined ALL required channels."""
+    if not force_join or not force_join_channels:
+        return True
+    user = update.effective_user
+    if user is None:
+        return True
+    if is_admin(user.id):
+        return True
+
+    # Run one-time migration of invite hash IDs to real chat IDs
+    await _migrate_force_join_ids(context)
+
+    missing = await get_missing_channels(context, user.id)
+    if not missing:
+        return True
+
+    # Only show buttons/text for groups the user has NOT joined yet
+    reply_markup = build_force_join_keyboard(missing)
+    text = build_force_join_text(missing)
+    try:
+        if update.callback_query is not None:
+            await safe_edit_message(update.callback_query, text, reply_markup=reply_markup)
+        elif update.message is not None:
+            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    except Exception as e:
+        print(f"Force join reply error: {e}", flush=True)
+    return False
+
+
+def is_admin(uid): return uid in ADMIN_IDS
+def is_vip(uid): return uid in vip_users
+
+
+def get_vip_limit(uid):
+    """Daily like limit for a VIP user. 0 means unlimited."""
+    suid = str(uid)
+    users = vip_limits.get("users", {}) or {}
+    if suid in users:
+        try:
+            return int(users[suid] or 0)
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return int(vip_limits.get("default", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_vip_limit(uid, limit):
+    """Set a VIP user's daily like limit. 0 = unlimited."""
+    global vip_limits
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        return False
+    users = dict(vip_limits.get("users", {}) or {})
+    users[str(uid)] = limit
+    vip_limits["users"] = users
+    return True
+
+
+def clear_vip_limit(uid):
+    """Remove a VIP user's own limit (falls back to the default)."""
+    global vip_limits
+    users = dict(vip_limits.get("users", {}) or {})
+    users.pop(str(uid), None)
+    vip_limits["users"] = users
+    return True
+
+
+def set_vip_default_limit(limit):
+    """Set the default daily limit applied to every VIP without an override."""
+    global vip_limits
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        return False
+    vip_limits["default"] = limit
+    return True
+
+
+def vip_usage(uid):
+    """How many likes this VIP has used today."""
+    suid = str(uid)
+    t = today_str()
+    entry = user_limits.get(suid)
+    if not entry or entry.get('date') != t:
+        return 0
+    try:
+        return int(entry.get('count', 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+def today_str(): return str(date.today())
+
+def get_next_reset_time():
+    """Return the next Bangladesh midnight (12:00 AM Asia/Dhaka) as a datetime."""
+    now_bd = datetime.now(BD_TZ)
+    # Next midnight in BD time
+    next_midnight_bd = (now_bd + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return next_midnight_bd
+
+
+def can_user_like(user_id, target_uid=None):
+    """Check if user can send a like request.
+    
+    Admin/VIP: unlimited, no restrictions, never touch per-UID locks.
+    Normal users: ONE like per UID per Bangladesh day (GLOBAL lock - once any normal
+    user claims a UID today, no other normal user can claim it until reset).
+    Plus 30s cooldown and per-user daily_count safety cap.
+    
+    Returns True if allowed, or a string error message if blocked.
+    """
+    if is_admin(user_id):
+        return True
+
+    # VIP users: unlimited by default, or a configurable daily limit.
+    if is_vip(user_id):
+        vip_cap = get_vip_limit(user_id)
+        if not vip_cap:
+            return True
+        used = vip_usage(user_id)
+        if used >= vip_cap:
+            next_reset = get_next_reset_time()
+            reset_str = next_reset.strftime("%I:%M %p %Z, %d %b %Y")
+            return (
+                f"👑 *VIP DAILY LIMIT REACHED*\n\n"
+                f"📊 Used: `{used}/{vip_cap}` likes today\n"
+                f"⏰ Next reset: {reset_str}\n"
+                f"💎 Ask the admin to raise your VIP limit."
+            )
+        return True
+
+    # Cooldown check: 30 seconds between likes
+    now_ts = time.time()
+    last = user_cooldowns.get(user_id, 0)
+    if now_ts - last < 30:
+        remaining = int(30 - (now_ts - last))
+        return f"⏳ Please wait {remaining} seconds before your next like request!"
+    
+    t = today_str()  # Bangladesh date string
+    
+    # STRICT GLOBAL per-UID per-day lock: check if this UID was already claimed
+    # by ANY normal user today
+    if target_uid:
+        with uid_daily_lock:
+            # Clean old entries (keep only today's claims)
+            uid_daily_clean = {uid: d for uid, d in user_uid_daily.items() if d == t}
+            user_uid_daily.clear()
+            user_uid_daily.update(uid_daily_clean)
+            
+            if target_uid in user_uid_daily:
+                next_reset = get_next_reset_time()
+                reset_str = next_reset.strftime("%I:%M %p %Z, %d %b %Y")
+                return (
+                    f"🚫 UID *`{target_uid}`* already claimed today!\n"
+                    f"📅 One like per UID per Bangladesh day.\n"
+                    f"⏰ Next reset: {reset_str}\n"
+                    f"💡 Try again after the daily reset."
+                )
+            
+            # Per-user daily count safety cap
+            suid = str(user_id)
+            if suid not in user_limits or user_limits[suid].get('date') != t:
+                user_limits[suid] = {'date': t, 'count': 0}
+            if user_limits[suid]['count'] >= daily_limit:
+                used = user_limits[suid]['count']
+                next_reset = get_next_reset_time()
+                reset_str = next_reset.strftime("%I:%M %p %Z, %d %b %Y")
+                return (
+                    f"⚠️ Daily limit reached!\n"
+                    f"📊 Used: `{used}/{daily_limit}` likes today\n"
+                    f"⏰ Next reset: {reset_str}"
+                )
+    
+    return True
+
+def update_user_like(user_id, target_uid=None):
+    """Record a like for a normal user (called ONLY after successful API response).
+
+    Admin: never touches per-UID locks or user limits.
+    VIP with a daily limit: counted (so the limit is enforced) but keeps the
+        VIP privilege of liking the same UID again — no per-UID lock, no cooldown.
+    VIP without a limit (0 = unlimited): behaves exactly like before.
+    Normal users: record UID claim (global lock) and increment daily count.
+    """
+    if is_admin(user_id):
+        return
+
+    if is_vip(user_id):
+        if not get_vip_limit(user_id):
+            return
+        t = today_str()
+        suid = str(user_id)
+        if suid not in user_limits or user_limits[suid].get('date') != t:
+            user_limits[suid] = {'date': t, 'count': 0}
+        user_limits[suid]['count'] += 1
+        if t not in daily_stats:
+            daily_stats[t] = {'total': 0, 'users': {}}
+        daily_stats[t]['total'] += 1
+        if suid not in daily_stats[t]['users']:
+            daily_stats[t]['users'][suid] = 0
+        daily_stats[t]['users'][suid] += 1
+        save_all()
+        return
+
+    # Set cooldown timestamp
+    user_cooldowns[user_id] = time.time()
+    
+    t = today_str()
+    suid = str(user_id)
+    
+    # Record GLOBAL per-UID per-day claim (only for normal users)
+    if target_uid:
+        with uid_daily_lock:
+            user_uid_daily[target_uid] = t
+    
+    # Per-user daily count
+    if suid not in user_limits or user_limits[suid].get('date') != t:
+        user_limits[suid] = {'date': t, 'count': 0}
+    user_limits[suid]['count'] += 1
+    
+    if t not in daily_stats:
+        daily_stats[t] = {'total': 0, 'users': {}}
+    daily_stats[t]['total'] += 1
+    if suid not in daily_stats[t]['users']:
+        daily_stats[t]['users'][suid] = 0
+    daily_stats[t]['users'][suid] += 1
+    save_all()
+
+async def call_like_api(server_name, uid, limit=None):
+    try:
+        base = API_URL.rstrip("/") + "/"
+        url = f"{base}like?uid={uid}&server_name={server_name}&key={API_KEY}"
+        if limit:
+            url += f"&limit={int(limit)}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    # Surface the API's real error message instead of a bare HTTP code.
+                    try:
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        body = None
+                    if isinstance(body, dict) and body.get("error"):
+                        body.setdefault("status", body.get("status", resp.status))
+                        return body
+                    return {"error": f"HTTP {resp.status}"}
+    except asyncio.TimeoutError:
+        return {"error": "Timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+def is_group_allowed(chat_id, chat_type):
+    if chat_type == "private":
+        return True
+    if bot_mode == "public":
+        return True
+    # Check SQLite DB first (authoritative group status)
+    db_allowed = is_group_allowed_db(chat_id, chat_type)
+    # Also check legacy allowed_groups for backward compatibility
+    legacy_allowed = str(chat_id) in allowed_groups
+    return db_allowed or legacy_allowed
+
+async def reset_midnight(context: ContextTypes.DEFAULT_TYPE):
+    """Reset all daily per-UID locks and user limits at Bangladesh midnight."""
+    global user_limits, user_uid_daily
+    with uid_daily_lock:
+        user_limits = {}
+        user_uid_daily = {}
+    save_all()
+    now_bd = datetime.now(BD_TZ)
+    print(f"[{now_bd.isoformat()}] ✅ Daily limits reset (per-UID locks cleared) - Bangladesh midnight")
+
+async def block_non_admin_private(update: Update) -> bool:
+    chat_type = update.effective_chat.type
+    user_id = update.effective_user.id
+    if chat_type == "private" and not is_admin(user_id) and not is_vip(user_id):
+        await update.message.reply_text("🚫 *Bot works only in groups!*\n(Admins and VIP users can use in private)")
+        return True
+    return False
+
+async def reply(update, text):
+    try:
+        await update.message.reply_text(text)
+    except Exception as e:
+        print(f"Reply failed: {e}", flush=True)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors and notify user with actual error details."""
+    import traceback
+    err = context.error
+    print(f"Exception while handling update: {err}", flush=True)
+    traceback.print_exc()
+    err_type = type(err).__name__
+    err_msg = str(err)[:200]
+    try:
+        if hasattr(update, 'effective_message') and update.effective_message:
+            await update.effective_message.reply_text(
+                f"❌ Bot error: {err_type}\n{err_msg}\n\nPlease contact the bot admin."
+            )
+    except Exception:
+        pass
+
+# ============ USER COMMANDS ============
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    if not await force_join_check(update, context): return
+    if bot_status == "off":
+        await reply(update, "🔴 Bot is currently OFF")
+        return
+    # Register this chat for broadcasts (users + groups)
+    register_chat(update)
+    await reply(update, welcome_msg)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await force_join_check(update, context): return
+    if bot_status == "off":
+        await reply(update, "🔴 Bot is OFF")
+        return
+    register_chat(update)
+    user_id = update.effective_user.id
+    is_adm = user_id in ADMIN_IDS
+    is_v = user_id in vip_users
+
+    msg = (
+        "╭─────────────────────────────────────────────╮\n"
+        "│ 💎 *𝑭𝑭 𝑳𝑰𝑲𝑬𝑺 𝑷RO — 𝑪𝑶𝑴𝑴𝑨𝑵𝑫 𝑴𝑬𝑵𝒰* │\n"
+        "╰─────────────────────────────────────────────╯\n\n"
+    )
+
+    # USER SECTION
+    msg += "👤 *𝑼𝑺𝑬𝑹 𝑪𝑶𝑴𝑴𝑨𝑵𝑫𝑺*\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "🔹 `/start` — Welcome message\n"
+    msg += "🔹 `/help` — This command menu\n"
+    msg += "🔹 `/info` — Check your likes & VIP status\n"
+    msg += "🔹 `/like REGION UID` — Send Free Fire likes\n"
+    msg += "   📌 _Example: `/like BD 1234567890`_\n"
+    msg += "🔹 `/myautolike` — View your auto-like tasks\n"
+    msg += "🔹 `/vipstatus` — Check your VIP status\n"
+    msg += "🔹 `/setlang en|bn` — Change language\n"
+    msg += "🔹 `/leaderboard` — Top users today\n"
+    msg += "🔹 `/likehistory` — Your like history\n"
+    msg += "\n"
+
+    # VIP SECTION
+    if is_v:
+        msg += "👑 *𝑽𝑰𝑷 𝑺𝑻𝑨𝑻𝑼𝑺*\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "🔥 *VIP ACTIVE* — Unlimited likes!\n"
+        msg += "💬 Private chat access enabled\n"
+        msg += "\n"
+
+    # ADMIN SECTION
+    if is_adm:
+        msg += "👑 *𝑨𝑫𝑴𝑰𝑵 𝑪𝑶𝑴𝑴𝑨𝑵𝑫𝑺*\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "⚡ `/off` / `/on` — Turn bot off/on\n"
+        msg += "📊 `/stats` — Today's usage stats\n"
+        msg += "🔒 `/setprivate` / `/setpublic` — Group mode\n"
+        msg += "📋 `/setlimit <num>` — Daily like limit\n"
+        msg += "🔢 `/setapi100` — 100 tokens mode\n"
+        msg += "🔢 `/setapi <num>` — Custom tokens (10–400)\n"
+        msg += "🚀 `/setapimax` or `/maxff` — 400 tokens max\n"
+        msg += "\n"
+        msg += "🔗 *Force-Join:*\n"
+        msg += "   `/addforcejointhisgroup` — Add current group/channel\n"
+        msg += "   `/addforcejointhisgroup @username` — Add by username\n"
+        msg += "   `/removeforcejoin <id>` / `all` — Remove\n"
+        msg += "   `/forcejoinlist` / `/forcejoinstatus` — View\n"
+        msg += "   `/forcejoinon` / `/forcejoinoff` — Toggle\n"
+        msg += "   `/clearforcejoin confirm` — Clear all\n"
+        msg += "\n"
+        msg += "👥 *Group Management:*\n"
+        msg += "   `/registergroup <id>` — Register group\n"
+        msg += "   `/allowgroup <id>` / `/blockgroup <id>`\n"
+        msg += "   `/groups` — List all groups\n"
+        msg += "   `/syncgroups` — Sync from broadcast\n"
+        msg += "\n"
+        msg += "💾 *Backup & API:*\n"
+        msg += "   `/backup` / `/backupstatus`\n"
+        msg += "   `/apistatus` — Token bank info\n"
+        msg += "   `/broadcast <msg>` — Send to all\n"
+        msg += "   `/dailyreport` — Today's report\n"
+        msg += "   `/setwelcome` / `/setgoodbye` — Custom msgs\n"
+        msg += "\n"
+
+    # AUTO LIKE SECTION
+    msg += "🔥 *𝑨𝑼𝑻𝑶 𝑳𝑰𝑲𝑬 𝑪𝑶𝑴𝑴𝑨𝑵𝑫𝑺*\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "⚡ `/autolike REGION UID TOTAL` — Create task\n"
+    msg += "   _Schedule: Daily 04:01 AM BD_\n"
+    msg += "📋 `/autolikeinfo UID` — Task details\n"
+    msg += "⏹️ `/stopautolike UID` — Stop task\n"
+    msg += "▶️ `/resumeautolike UID` — Resume task\n"
+    msg += "🗑️ `/removeautolike UID` — Remove task permanently\n"
+    msg += "📊 `/autolikestatus` — All tasks (admin)\n"
+    msg += "📋 `/autolikelist` — List all tasks (admin)\n"
+    msg += "\n"
+
+    # ANNOUNCEMENT SECTION
+    if is_adm:
+        msg += "📢 *𝑨𝑵𝑵𝑶𝑼𝑵𝑪𝑬𝑴𝑬𝑵𝑻 𝑪𝑶𝑴𝑴𝑨𝑵𝑫𝑺*\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "📺 `/setautolikechannel @channel`\n"
+        msg += "👥 `/setautolikegroup <group_id>`\n"
+        msg += "ℹ️ `/autolikeannouncestatus` — View config\n"
+        msg += "\n"
+
+    # VIP ADMIN SECTION
+    if is_adm:
+        msg += "👑 *𝑽𝑰𝑷 𝑴𝑨𝑵𝑨𝑮𝑬𝑴𝑬𝑵𝑻 𝑪𝑶𝑴𝑴𝑨𝑵𝑫𝑺*\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "➕ `/addvip <user_id>` — Add VIP user\n"
+        msg += "➖ `/removevip <user_id>` — Remove VIP\n"
+        msg += "📋 `/vipusers` — List all VIPs\n"
+        msg += "💎 `/viplimit` — Set VIP like limits\n"
+        msg += "\n"
+
+    msg += "╭─────────────────────────────────────────────╮\n"
+    msg += "│ 🔥 Credits: @CATS_AI_solayman                    │\n"
+    msg += "╰─────────────────────────────────────────────╯\n"
+    await reply(update, msg)
+
+async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await force_join_check(update, context): return
+    if bot_status == "off":
+        await reply(update, "🔴 Bot is OFF")
+        return
+    register_chat(update)
+    uid = update.effective_user.id
+    if is_admin(uid):
+        await reply(update, "👑 *Admin Account*\n🔥 *Unlimited likes* – No daily limit.")
+        return
+    if is_vip(uid):
+        await reply(update, "👑 *VIP Account*\n🔥 *Unlimited likes* – No daily limit.\n💬 Private chat access enabled.")
+        return
+    t = today_str()
+    suid = str(uid)
+    used = user_limits.get(suid, {}).get('count', 0) if suid in user_limits and user_limits[suid]['date'] == t else 0
+    remaining = daily_limit - used
+    msg = (
+        "🤖 *𝑩𝑶𝑻 𝑰𝑵𝑭𝑶*\n\n"
+        f"⚙️ Mode: {bot_mode.upper()}\n"
+        f"🟢 Status: {bot_status.upper()}\n"
+        f"📅 Daily limit: {daily_limit} likes\n"
+        f"✅ Used today: {used}\n"
+        f"🟢 Remaining: {remaining}\n"
+        f"👥 Allowed groups: {len(allowed_groups)}"
+    )
+    await reply(update, msg)
+
+# ============ PREMIUM LIKE PROGRESS UI ============
+LIKE_PROGRESS_TITLE = "💎 𝗨𝗟𝗧𝗥𝗔 𝗣𝗥𝗢 𝗟𝗜𝗞𝗘𝗦 💎"
+LIKE_PROGRESS_RULE = "━━━━━━━━━━━━━━━━━━━━━━"
+LIKE_PROGRESS_FOOTER = "POWERED BY FF LIKES PRO"
+LIKE_PROGRESS_BAR_CELLS = 10
+
+# Stage-based estimated progress (API gives no live progress data).
+# The animation runs from 10% up to 95% and stops as soon as the API
+# returns any final result. 100% means "API processing finished" and is
+# rendered only in the final message (success, limit reached or error).
+LIKE_PROGRESS_STAGES = [
+    (10, "Synchronizing premium engine..."),
+    (25, "Connecting to servers..."),
+    (45, "Processing like request..."),
+    (65, "Deploying likes..."),
+    (95, "Finalizing delivery..."),
+]
+
+
+def _premium_bar(percent: int) -> str:
+    """Render the animated progress bar for a percentage."""
+    percent = max(0, min(100, int(percent)))
+    if percent >= 100:
+        filled = LIKE_PROGRESS_BAR_CELLS
+    else:
+        # Never show a completely full bar before 100%.
+        filled = min(LIKE_PROGRESS_BAR_CELLS - 1, max(0, int(percent / 10 + 0.5)))
+    return "▰" * filled + "▱" * (LIKE_PROGRESS_BAR_CELLS - filled)
+
+
+def _premium_frame(uid: str, region: str) -> str:
+    """Premium header showing ONLY UID and Region as player information."""
+    return (
+        f"{LIKE_PROGRESS_TITLE}\n"
+        f"{LIKE_PROGRESS_RULE}\n\n"
+        f'🆔 UID: "{uid}"\n\n'
+        f'🌐 Region: "{region}"\n\n'
+        f"{LIKE_PROGRESS_RULE}\n\n"
+    )
+
+
+def build_premium_progress_text(uid: str, region: str, percent: int, stage_text: str) -> str:
+    """Live processing screen — premium design, UID + Region only."""
+    return (
+        _premium_frame(uid, region)
+        + f"◐ {stage_text}\n\n"
+        + f"{_premium_bar(percent)} {int(percent)}%\n\n"
+        + "✨ Delivering your likes...\n\n"
+        + f"{LIKE_PROGRESS_RULE}\n\n"
+        + f"{LIKE_PROGRESS_FOOTER}"
+    )
+
+
+def build_premium_result_text(uid: str, region: str, percent: int, headline: str,
+                               details: str = "", tagline: str = "✨ Delivering your likes...") -> str:
+    """Final screen (success / limit reached / error) — same premium frame.
+
+    `percent` is 100 for every final state: 100% means the API finished
+    processing, not that the likes were delivered.
+    """
+    body = f"◐ {headline}\n\n" if headline else ""
+    detail_block = f"{details}\n\n" if details else ""
+    return (
+        _premium_frame(uid, region)
+        + body
+        + f"{_premium_bar(percent)} {int(percent)}%\n\n"
+        + detail_block
+        + f"{tagline}\n\n"
+        + f"{LIKE_PROGRESS_RULE}\n\n"
+        + f"{LIKE_PROGRESS_FOOTER}"
+    )
+
+
+async def _safe_edit_progress(proc_msg, text: str) -> bool:
+    """Edit the live progress message in place.
+
+    Never raises: tolerates 'Message is not modified', rate limits (RetryAfter),
+    network and other Telegram errors.
+    """
+    if proc_msg is None:
+        return False
+    for _ in range(3):
+        try:
+            await proc_msg.edit_text(text)
+            return True
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return True
+            print(f"⚠️ Progress edit BadRequest: {e}", flush=True)
+            return False
+        except RetryAfter as e:
+            wait = getattr(e, "retry_after", 1)
+            try:
+                wait = float(wait.total_seconds()) if hasattr(wait, "total_seconds") else float(wait)
+            except Exception:
+                wait = 1.0
+            print(f"⏳ Rate limited while updating progress, waiting {wait}s", flush=True)
+            await asyncio.sleep(wait)
+            continue
+        except (NetworkError, TelegramError) as e:
+            print(f"⚠️ Progress edit failed: {e}", flush=True)
+            return False
+        except Exception as e:
+            print(f"⚠️ Unexpected progress edit error: {e}", flush=True)
+            return False
+    return False
+
+
+async def _run_like_progress_animation(proc_msg, uid: str, region: str, stop_event, state):
+    """Animate the premium progress bar by editing the SAME Telegram message.
+
+    Runs from 10% up to 95% and stops as soon as `stop_event` is set.
+    Never touches the message once the final result has been flagged in
+    `state["final"]`, so it can never overwrite the final 100% result.
+    """
+    percent = LIKE_PROGRESS_STAGES[0][0]
+    state["percent"] = percent
+    state["stage"] = LIKE_PROGRESS_STAGES[0][1]
+    idx = 0
+
+    while not stop_event.is_set():
+        if state.get("final"):
+            return
+        target, stage_text = LIKE_PROGRESS_STAGES[idx]
+        state["stage"] = stage_text
+
+        # Smoothly animate the bar up to this stage's percentage.
+        step = max(1, (target - percent) // 3)
+        while percent < target:
+            if stop_event.is_set() or state.get("final"):
+                return
+            percent = min(target, percent + step)
+            state["percent"] = percent
+            await _safe_edit_progress(
+                proc_msg,
+                build_premium_progress_text(uid, region, percent, stage_text),
+            )
+            await asyncio.sleep(0.6)
+
+        idx += 1
+        if idx >= len(LIKE_PROGRESS_STAGES):
+            # Hold at the last stage (95%) until the API responds.
+            while not stop_event.is_set() and not state.get("final"):
+                await asyncio.sleep(0.3)
+            return
+        await asyncio.sleep(0.7)
+
+
+async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /like REGION UID command."""
+    if await block_non_admin_private(update): return
+    if not await force_join_check(update, context):
+        return
+    if bot_status == "off":
+        await reply(update, "🔴 Bot is currently OFF")
+        return
+    register_chat(update)
+
+    try:
+        await _like_cmd_inner(update, context)
+    except Exception as e:
+        import traceback
+        print(f"❌ Uncaught exception in like_cmd: {e}", flush=True)
+        traceback.print_exc()
+        await reply(update, f"❌ Like command error: {type(e).__name__}\n{str(e)[:200]}")
+
+
+async def _like_cmd_inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inner like command logic (separated for error handling)."""
+    if not await force_join_check(update, context): return
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    if chat_type != "private" and not is_group_allowed(chat_id, chat_type):
+        await reply(update, "🚫 This bot works only in allowed groups!")
+        return
+
+    if len(context.args) != 2:
+        await reply(update, '❌ Usage: "/like REGION UID"\n\n💡 Example: "/like BD 123456789"\n\n⚡ Fast Like • Easy Command\n👑 Powered by FF LIKES PRO')
+        return
+
+    region = context.args[0].upper()
+    uid = context.args[1]
+    if not uid.isdigit():
+        await reply(update, "❌ UID must contain only numbers!")
+        return
+
+    # UIDs already in the Auto-Like list are served by the scheduler —
+    # never send a manual like request for them.
+    if is_uid_in_auto_like_tasks(uid):
+        await reply(
+            update,
+            "⛔ *AUTO-LIKE LIST*\n\n"
+            f"🆔 UID: `{uid}`\n\n"
+            "This UID is already registered in the Auto-Like list, "
+            "so no like request was sent.\n\n"
+            "💎 FF LIKES PRO delivers likes to this ID automatically every day.\n"
+            "👉 Use a different UID for a manual like."
+        )
+        return
+
+    user_id = update.effective_user.id
+    like_check = can_user_like(user_id, uid)
+    if like_check is not True:
+        if isinstance(like_check, str):
+            await reply(update, like_check)
+            return
+        used = user_limits.get(str(user_id), {}).get('count', 0)
+        await reply(update, f"⚠️ Daily limit reached!\nYou have used `{used}/{daily_limit}` likes today.\n💡 Try again tomorrow.")
+        return
+
+    # Send the premium live-progress message (the SAME message is edited later)
+    proc_msg = None
+    try:
+        proc_msg = await update.message.reply_text(
+            build_premium_progress_text(
+                uid, region, LIKE_PROGRESS_STAGES[0][0], LIKE_PROGRESS_STAGES[0][1]
+            )
+        )
+    except (BadRequest, NetworkError, RetryAfter, TelegramError) as e:
+        import traceback
+        print(f"❌ Failed to send processing message in like_cmd: {e}", flush=True)
+        traceback.print_exc()
+        await reply(update, f"❌ Failed to start like request. Telegram error: {e}")
+        return
+    except Exception as e:
+        import traceback
+        print(f"❌ Unexpected error sending processing message: {e}", flush=True)
+        traceback.print_exc()
+        await reply(update, f"❌ Failed to start like request: {e}")
+        return
+
+    # Run the API call alongside the live progress animation.
+    stop_event = asyncio.Event()
+    progress_state = {
+        "percent": LIKE_PROGRESS_STAGES[0][0],
+        "stage": LIKE_PROGRESS_STAGES[0][1],
+        "final": False,
+    }
+    api_task = asyncio.create_task(call_like_api(region, uid, like_tokens))
+    anim_task = asyncio.create_task(
+        _run_like_progress_animation(proc_msg, uid, region, stop_event, progress_state)
+    )
+    try:
+        data = await api_task
+    except Exception as e:
+        print(f"❌ Like API task failed: {e}", flush=True)
+        data = {"error": str(e)}
+    finally:
+        # Stop the animation BEFORE rendering the final result, so no
+        # background progress edit can overwrite the final 100% message.
+        stop_event.set()
+        progress_state["final"] = True
+        try:
+            # Let the animator finish its current edit and exit cleanly.
+            await asyncio.wait_for(anim_task, timeout=2.5)
+        except asyncio.TimeoutError:
+            anim_task.cancel()
+            try:
+                await anim_task
+            except asyncio.CancelledError:
+                pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"⚠️ Progress animator stopped: {e}", flush=True)
+
+    # Helper to safely edit or fall back to new message
+    async def _respond(text, fallback_text=None):
+        """Try to edit proc_msg; if that fails, send a new message."""
+        sent = None
+        if proc_msg is not None:
+            try:
+                await proc_msg.edit_text(text)
+                return proc_msg
+            except (BadRequest, NetworkError, RetryAfter, TelegramError) as e:
+                import traceback
+                print(f"❌ Failed to edit processing message in like_cmd: {e}", flush=True)
+                traceback.print_exc()
+            except Exception as e:
+                import traceback
+                print(f"❌ Unexpected error editing processing message: {e}", flush=True)
+                traceback.print_exc()
+        # Fallback: send new message
+        try:
+            sent = await update.message.reply_text(fallback_text or text)
+            return sent
+        except (BadRequest, NetworkError, RetryAfter, TelegramError) as e:
+            import traceback
+            print(f"❌ Failed to send fallback message in like_cmd: {e}", flush=True)
+            traceback.print_exc()
+        except Exception as e:
+            import traceback
+            print(f"❌ Unexpected error sending fallback message: {e}", flush=True)
+            traceback.print_exc()
+        return None
+
+    # API returned an error — the API finished, so the final state is 100%.
+    if data is None or "error" in data:
+        error_msg = data.get("error", "Unknown error") if data else "No response"
+        if data and data.get("status") == 4:
+            headline = "🔑 Token Bank Error"
+            details = f"⚠️ {error_msg}"
+        else:
+            headline = "❌ API Error!"
+            details = f"⚠️ {error_msg}\n\n💡 Please try again later."
+        await _respond(
+            build_premium_result_text(
+                uid, region, 100, headline, details,
+                tagline="⚠️ Request failed.",
+            )
+        )
+        return
+
+    # Handle error responses from ZIP API
+    if data.get("error"):
+        error_msg = data.get("error", "Unknown error")
+        details = f"⚠️ {error_msg}"
+        if data.get("status") == 0:
+            details += "\n\n💡 Please try again later."
+        await _respond(
+            build_premium_result_text(
+                uid, region, 100, "❌ API Error!", details,
+                tagline="⚠️ Request failed.",
+            )
+        )
+        return
+
+    status = data.get('status')
+    if status is None:
+        await _respond(
+            build_premium_result_text(
+                uid, region, 100,
+                "❌ Invalid API response",
+                "⚠️ The server returned an unexpected format.",
+                tagline="⚠️ Request failed.",
+            )
+        )
+        return
+
+    player = data.get('PlayerNickname', 'Unknown')
+    uid_resp = data.get('UID', uid)
+    region_resp = region
+    level = data.get('Level', 'N/A')
+    before = data.get('LikesbeforeCommand', 0)
+    after = data.get('LikesafterCommand', 0)
+    given = data.get('LikesGivenByAPI', 0)
+    api_rem = data.get('remains', 'N/A')
+
+    if status == 1:
+        update_user_like(user_id, uid)
+        # Persist successful like history
+        log_successful_like(uid, region, given, before, after, user_id)
+        save_all()
+        user_used = user_limits.get(str(user_id), {}).get('count', 0) if not is_admin(user_id) else "Unlimited"
+        # 100% = API processing finished (the API confirmed a successful like).
+        result = build_premium_result_text(
+            uid, region, 100, "Completed Successfully!",
+            f"✅ LIKE SENT ✅\n\n"
+            f"👤 Player: {player}\n"
+            f"⭐ Level: {level}\n\n"
+            f"❤️ Likes given: +{given}\n"
+            f"📊 Total: {before} → {after}\n\n"
+            f"📅 Your usage: {user_used}/{daily_limit if not is_admin(user_id) else '∞'}\n"
+            f"🎉 Success!",
+            tagline="✨ Delivering your likes...",
+        )
+    elif status == 2:
+        result = build_premium_result_text(
+            uid, region, 100,
+            "⚠️ LIMIT REACHED",
+            f"👤 Player: {player}\n"
+            f"⭐ Level: {level}\n\n"
+            f"❌ Likes sent: 0\n"
+            f"📊 Total likes: {before} (unchanged)\n\n"
+            f"📅 API remaining: {api_rem}\n\n"
+            f"😔 Could not send like to {player}",
+            tagline="⚠️ Like could not be delivered.",
+        )
+    else:
+        result = build_premium_result_text(
+            uid, region, 100,
+            "❓ Unknown API response",
+            f"⚠️ Status code: {status}\n\n💡 Please contact the bot admin.",
+            tagline="⚠️ Unexpected API response.",
+        )
+
+    # Reply to the user and capture the sent message (for native forwarding)
+    sent_msg = await _respond(result)
+
+    # Forward the EXACT success result message to ALL configured forward channels.
+    # Native forwardMessage preserves the original formatting exactly.
+    if status == 1 and sent_msg is not None:
+        for fwd_channel_id in forward_channel_ids:
+            if not fwd_channel_id:
+                continue
+            sent_ok = False
+            for attempt in range(2):
+                try:
+                    await context.bot.forward_message(
+                        chat_id=fwd_channel_id,
+                        from_chat_id=sent_msg.chat.id,
+                        message_id=sent_msg.message_id,
+                    )
+                    print(f"✅ Forwarded successful like to {fwd_channel_id}", flush=True)
+                    sent_ok = True
+                    break
+                except Exception as e:
+                    print(f"⚠️ Forward attempt {attempt + 1} failed for {fwd_channel_id}: {e}", flush=True)
+                    if attempt == 0:
+                        await asyncio.sleep(2)
+            if not sent_ok:
+                # Fall back to direct copy if native forward keeps failing
+                try:
+                    await context.bot.send_message(chat_id=fwd_channel_id, text=result)
+                    print(f"✅ Fallback copy sent to {fwd_channel_id}", flush=True)
+                except Exception as e2:
+                    print(f"❌ Both forward and fallback failed for {fwd_channel_id}: {e2}", flush=True)
+            # Small delay between channels to avoid rate limits
+            await asyncio.sleep(1)
+
+# ============ JWT TOKEN UPLOAD HANDLER ============
+# Broadcast list file
+BROADCAST_FILE = "broadcast_list.json"
+
+# Successful likes log file
+LIKE_LOG_FILE = "successful_likes.json"
+LIKE_HISTORY_FILE = "like_history.json"  # Per-user like history
+
+
+def _load_broadcast_data():
+    data = _read_json(BROADCAST_FILE, None)
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("chats", {})
+    data.setdefault("users", {})
+    return data
+
+
+def _save_broadcast_data(data):
+    try:
+        with open(BROADCAST_FILE, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Broadcast list write failed: {e}", flush=True)
+        return
+    if github_persistence:
+        try:
+            github_persistence.queue_push('broadcast')
+        except Exception as e:
+            print(f"⚠️ GitHub queue failed for broadcast: {e}", flush=True)
+
+
+def add_to_broadcast(chat_id, chat_type, chat_title=None):
+    """Register a group/supergroup/channel chat for broadcasts."""
+    data = _load_broadcast_data()
+    cid = str(chat_id)
+    entry = data["chats"].get(cid)
+    if entry is None:
+        data["chats"][cid] = {
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "title": chat_title or "",
+            "added_at": str(date.today()),
+        }
+        _save_broadcast_data(data)
+    elif chat_title and entry.get("title") != chat_title:
+        entry["title"] = chat_title
+        entry["chat_type"] = chat_type
+        _save_broadcast_data(data)
+
+
+def add_user_to_broadcast(user_id, username=None, first_name=None):
+    """Register a private user chat for broadcasts."""
+    data = _load_broadcast_data()
+    uid = str(user_id)
+    entry = data["users"].get(uid)
+    if entry is None:
+        data["users"][uid] = {
+            "user_id": user_id,
+            "username": username or "",
+            "first_name": first_name or "",
+            "added_at": str(date.today()),
+        }
+        _save_broadcast_data(data)
+    else:
+        changed = False
+        if username and entry.get("username") != username:
+            entry["username"] = username
+            changed = True
+        if first_name and entry.get("first_name") != first_name:
+            entry["first_name"] = first_name
+            changed = True
+        if changed:
+            _save_broadcast_data(data)
+
+
+def register_chat(update: Update):
+    """Save every user/group that interacts with the bot (for broadcasts)."""
+    try:
+        chat = update.effective_chat
+        if chat is None:
+            return
+        if chat.type == "private":
+            add_user_to_broadcast(chat.id, getattr(chat, "username", None), getattr(chat, "first_name", None))
+        else:
+            add_to_broadcast(chat.id, chat.type, getattr(chat, "title", None))
+    except Exception as e:
+        print(f"⚠️ register_chat failed: {e}", flush=True)
+
+
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-register groups when the bot is added, and unregister when removed/kicked.
+
+    Handles my_chat_member updates so groups are tracked even when no user
+    sends a command. Also removes groups from broadcast when the bot leaves
+    or is kicked.
+    """
+    try:
+        chat = update.effective_chat
+        if chat is None:
+            return
+        my_member = update.my_chat_member
+        if my_member is None:
+            return
+
+        old_status = my_member.old_chat_member.status
+        new_status = my_member.new_chat_member.status
+
+        # Get status as string (PTB enum -> str)
+        def _status_str(s):
+            return getattr(s, "value", s)
+
+        old_s = _status_str(old_status)
+        new_s = _status_str(new_status)
+
+        # Bot was added to or became admin/member in a group/supergroup/channel
+        if new_s in ("member", "administrator", "creator") and old_s not in ("member", "administrator", "creator"):
+            add_to_broadcast(chat.id, chat.type, getattr(chat, "title", None))
+            upsert_group(
+                chat_id=chat.id,
+                chat_title=getattr(chat, "title", None),
+                chat_username=getattr(chat, "username", None),
+                chat_type=chat.type,
+                status='allowed',
+                bot_member_status=new_s,
+                added_by=update.effective_user.id if update.effective_user else None
+            )
+            print(f"✅ Auto-registered chat {chat.id} ({chat.type}) via my_chat_member", flush=True)
+            return
+
+        # Bot was already a member but chat info changed (title/username update)
+        if new_s in ("member", "administrator", "creator") and old_s in ("member", "administrator", "creator"):
+            upsert_group(
+                chat_id=chat.id,
+                chat_title=getattr(chat, "title", None),
+                chat_username=getattr(chat, "username", None),
+                chat_type=chat.type,
+                # Do NOT pass status — preserve existing ALLOWED/BLOCKED/INACTIVE
+                bot_member_status=new_s
+            )
+            print(f"🔄 Updated chat {chat.id} ({chat.type}) info via my_chat_member", flush=True)
+            return
+
+        # Bot was kicked/left — mark as inactive in DB (don't delete record)
+        if new_s in ("left", "kicked") and old_s in ("member", "administrator", "creator"):
+            remove_from_broadcast(chat.id)
+            set_group_status(chat.id, 'inactive')
+            upsert_group(
+                chat_id=chat.id,
+                chat_title=getattr(chat, "title", None),
+                chat_username=getattr(chat, "username", None),
+                chat_type=chat.type,
+                status='inactive',
+                bot_member_status=new_s
+            )
+            print(f"🗑️ Marked chat {chat.id} ({chat.type}) as inactive (bot removed)", flush=True)
+            return
+    except Exception as e:
+        print(f"⚠️ my_chat_member_handler failed: {e}", flush=True)
+
+
+def remove_from_broadcast(chat_id):
+    """Remove a chat from the broadcast list (e.g. when bot is kicked from group)."""
+    try:
+        data = _load_broadcast_data()
+        cid = str(chat_id)
+        removed = False
+        if cid in data.get("chats", {}):
+            del data["chats"][cid]
+            removed = True
+        if removed:
+            _save_broadcast_data(data)
+            return True
+        return False
+    except Exception as e:
+        print(f"⚠️ remove_from_broadcast failed: {e}", flush=True)
+        return False
+
+
+async def register_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually register a group for broadcasts and SQLite DB. Admin only.
+
+    Usage: /registergroup              (registers current group)
+           /registergroup <CHAT_ID>    (registers a group by its chat ID)
+    """
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    # Determine target chat_id
+    if context.args and context.args[0].lstrip('-').isdigit():
+        # Manual registration by chat ID
+        target_chat_id = int(context.args[0])
+        try:
+            chat = await context.bot.get_chat(target_chat_id)
+            chat_title = getattr(chat, "title", None)
+            chat_username = getattr(chat, "username", None)
+            chat_type = chat.type
+        except Exception as e:
+            await reply(update, f"❌ Could not fetch chat `{target_chat_id}`:\n`{type(e).__name__}: {e}`")
+            return
+    else:
+        # Register current chat
+        chat = update.effective_chat
+        if chat is None or chat.type == "private":
+            await reply(update, "❌ Use this command in a group/supergroup, or provide a CHAT_ID.")
+            return
+        target_chat_id = chat.id
+        chat_title = getattr(chat, "title", None)
+        chat_username = getattr(chat, "username", None)
+        chat_type = chat.type
+
+    # Register in broadcast list
+    add_to_broadcast(target_chat_id, chat_type, chat_title)
+
+    # Register in SQLite DB (preserves existing ALLOWED/BLOCKED status)
+    upsert_group(
+        chat_id=target_chat_id,
+        chat_title=chat_title,
+        chat_username=chat_username,
+        chat_type=chat_type,
+        # Do NOT pass status — preserve existing ALLOWED/BLOCKED/INACTIVE
+        bot_member_status='member'
+    )
+
+    await reply(
+        update,
+        f"✅ *Group Registered*\n\n"
+        f"📢 Chat ID: `{target_chat_id}`\n"
+        f"📝 Title: {chat_title or 'Unknown'}\n"
+        f"📛 Username: {chat_username or 'No username'}\n"
+        f"📁 Type: {chat_type}\n"
+        f"🔢 Total groups in DB: `{len(get_all_groups())}`"
+    )
+
+
+async def apistatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show API token status. Admin only. Reads from the API's /token_info endpoint."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    try:
+        base = API_URL.rstrip("/") + "/"
+        url = f"{base}token_info?key={API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    await reply(update, f"❌ API Error: HTTP {resp.status}")
+                    return
+                data = await resp.json(content_type=None)
+
+        total = data.get("total", {})
+        files = data.get("files", {})
+        config = data.get("config", {})
+
+        total_tokens = total.get("tokens", 0)
+        used_today = total.get("used_today", 0)
+        capacity_today = total.get("capacity_today", 0)
+        remaining_today = total.get("remaining_today", 0)
+        likes_per_token = config.get("LIKES_PER_TOKEN_PER_DAY", 0)
+
+        # Count tokens per file
+        file_token_counts = {}
+        for fname, fstat in files.items():
+            file_token_counts[fname] = fstat.get("token_count", 0)
+
+        # Active = tokens remaining capacity (fresh/valid in bank)
+        active_tokens = total_tokens  # All tokens in bank are valid/fresh
+        invalid_tokens = 0
+
+        # Currently configured per-request tokens (from /setapi, /setapi100, /setapimax, /maxff)
+        current_like_tokens = like_tokens
+
+        # Determine mode name based on current like_tokens setting
+        if current_like_tokens == 400:
+            mode_name = "MAX FF Mode"
+        elif current_like_tokens == 100:
+            mode_name = "100 Token Mode"
+        else:
+            mode_name = "Custom API Mode"
+
+        msg = (
+            "🔑 *API STATUS*\n\n"
+            f"📊 Total API Tokens: `{total_tokens}`\n"
+            f"🟢 Active Tokens: `{active_tokens}`\n"
+            f"🔴 Invalid/Disabled: `{invalid_tokens}`\n\n"
+            f"⚙️ *API CONFIGURATION*\n"
+            f"📦 Total Available Tokens: `{total_tokens}`\n"
+            f"🎯 Currently Set Tokens: `{current_like_tokens}`\n"
+            f"❤️ Expected Likes: ~{current_like_tokens}\n"
+            f"🔧 Current Mode: {mode_name}\n\n"
+            f"📈 *DAILY USAGE*\n"
+            f"📊 Used Today: `{used_today}`\n"
+            f"📉 Remaining Today: `{remaining_today}`\n"
+            f"❤️ Likes Per Token/Day: `{likes_per_token}`\n"
+        )
+
+        # Per-file breakdown
+        if file_token_counts:
+            msg += "\n*Per File:*\n"
+            for fname, count in file_token_counts.items():
+                msg += f"• `{fname}`: `{count}` tokens\n"
+
+        msg += "\n🔐 @CATS_AI_solayman"
+        await reply(update, msg)
+
+    except asyncio.TimeoutError:
+        await reply(update, "❌ API request timed out.")
+    except Exception as e:
+        await reply(update, f"❌ Error fetching API status: `{type(e).__name__}`")
+
+
+# ============ GROUP MANAGEMENT COMMANDS ============
+
+async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all groups with pagination and ALLOW/BLOCK/DETAILS buttons. Admin only."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    # Parse page number from args
+    page = 0
+    if context.args and context.args[0].isdigit():
+        page = int(context.args[0])
+    if page < 0:
+        page = 0
+
+    groups = get_all_groups()
+    if not groups:
+        counts = get_group_count_by_status()
+        await reply(
+            update,
+            "👥 *Group Management*\n\n"
+            f"📊 Total Groups: `{counts.get('allowed', 0) + counts.get('blocked', 0) + counts.get('inactive', 0)}`\n"
+            f"🟢 Allowed: `{counts.get('allowed', 0)}`\n"
+            f"🔴 Blocked: `{counts.get('blocked', 0)}`\n"
+            f"⚪ Inactive: `{counts.get('inactive', 0)}`\n\n"
+            "No groups registered yet. Use `/syncgroups` to import existing groups, "
+            "or the bot will auto-register groups when added via my_chat_member."
+        )
+        return
+
+    counts = get_group_count_by_status()
+    total = len(groups)
+    per_page = 10
+    total_pages = (total + per_page - 1) // per_page
+    if page >= total_pages:
+        page = total_pages - 1
+
+    start = page * per_page
+    end = start + per_page
+    page_groups = groups[start:end]
+
+    # Build header
+    msg = (
+        "👥 *Group Management*\n\n"
+        f"📊 Total: `{total}` | 🟢 Allowed: `{counts.get('allowed', 0)}` | "
+        f"🔴 Blocked: `{counts.get('blocked', 0)}` | ⚪ Inactive: `{counts.get('inactive', 0)}`\n"
+        f"📄 Page `{page + 1}` of `{total_pages}`\n\n"
+    )
+
+    # Build group entries
+    for g in page_groups:
+        cid = g['chat_id']
+        title = g.get('chat_title') or 'Unknown'
+        username = g.get('chat_username') or 'No username'
+        ctype = g.get('chat_type') or 'group'
+        status = g.get('status', 'allowed')
+        added = (g.get('added_at') or 'Unknown')[:10]
+
+        status_emoji = "🟢" if status == 'allowed' else ("🔴" if status == 'blocked' else "⚪")
+        status_text = status.upper()
+
+        msg += (
+            f"{status_emoji} *{title}*\n"
+            f"   ID: `{cid}` | Type: {ctype} | Status: {status_text}\n"
+            f"   Username: {username} | Added: {added}\n\n"
+        )
+
+    # Build inline keyboard
+    keyboard = []
+    for g in page_groups:
+        cid = g['chat_id']
+        status = g.get('status', 'allowed')
+        allow_btn_text = "✅ ALLOW" if status != 'allowed' else "✅ ALLOWED"
+        block_btn_text = "🔴 BLOCK" if status != 'blocked' else "🔴 BLOCKED"
+        keyboard.append([
+            InlineKeyboardButton(allow_btn_text, callback_data=f"group_allow_{cid}"),
+            InlineKeyboardButton(block_btn_text, callback_data=f"group_block_{cid}"),
+            InlineKeyboardButton("ℹ️ DETAILS", callback_data=f"group_details_{cid}"),
+        ])
+
+    # Pagination buttons
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"groups_page_{page - 1}"))
+    if end < total:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"groups_page_{page + 1}"))
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    try:
+        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+    except Exception as e:
+        print(f"⚠️ groups_cmd reply failed: {e}", flush=True)
+
+
+async def allowgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow a group by chat ID. Admin only."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if not context.args or not context.args[0].lstrip('-').isdigit():
+        await reply(update, "❌ Usage: `/allowgroup <chat_id>`\nExample: `/allowgroup -1001234567890`")
+        return
+    chat_id = int(context.args[0])
+    set_group_status(chat_id, 'allowed')
+    # Also add to legacy allowed_groups for backward compat
+    allowed_groups[str(chat_id)] = {'name': '', 'by': update.effective_user.id, 'date': today_str()}
+    save_all()
+    detail = get_group_detail(chat_id)
+    title = detail.get('chat_title', 'Unknown') if detail else 'Unknown'
+    await reply(
+        update,
+        f"✅ *Group Allowed*\n\n"
+        f"📢 Chat ID: `{chat_id}`\n"
+        f"📝 Title: {title}\n"
+        f"Users can now use like commands in this group."
+    )
+
+
+async def blockgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Block a group by chat ID. Admin only."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if not context.args or not context.args[0].lstrip('-').isdigit():
+        await reply(update, "❌ Usage: `/blockgroup <chat_id>`\nExample: `/blockgroup -1001234567890`")
+        return
+    chat_id = int(context.args[0])
+    set_group_status(chat_id, 'blocked')
+    # Remove from legacy allowed_groups for backward compat
+    allowed_groups.pop(str(chat_id), None)
+    save_all()
+    detail = get_group_detail(chat_id)
+    title = detail.get('chat_title', 'Unknown') if detail else 'Unknown'
+    await reply(
+        update,
+        f"🔴 *Group Blocked*\n\n"
+        f"📢 Chat ID: `{chat_id}`\n"
+        f"📝 Title: {title}\n"
+        f"Normal users cannot use like commands in this group. Admin commands still work."
+    )
+
+
+async def syncgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sync groups from broadcast list into the SQLite database. Admin only.
+
+    Also attempts to fetch fresh chat info via get_chat() for each registered
+    broadcast chat so titles and usernames stay up to date.
+    """
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    # Step 1: Sync from broadcast list (preserves existing ALLOWED/BLOCKED status)
+    synced = sync_groups_from_broadcast()
+
+    # Step 2: Try to refresh chat info via get_chat() for each broadcast chat
+    data = _load_broadcast_data()
+    chats = data.get("chats", {})
+    refreshed = 0
+    for cid, info in chats.items():
+        try:
+            chat_id = int(cid)
+        except (TypeError, ValueError):
+            continue
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            upsert_group(
+                chat_id=chat_id,
+                chat_title=getattr(chat, "title", None) or info.get("title"),
+                chat_username=getattr(chat, "username", None),
+                chat_type=chat.type,
+                # Do NOT pass status — preserve existing ALLOWED/BLOCKED/INACTIVE
+                bot_member_status='member'
+            )
+            refreshed += 1
+        except Exception as e:
+            print(f"⚠️ Could not refresh chat {chat_id}: {e}", flush=True)
+
+    total = len(get_all_groups())
+    await reply(
+        update,
+        f"🔄 *Group Sync Complete*\n\n"
+        f"Synced from broadcast: `{synced}`\n"
+        f"Refreshed via get_chat: `{refreshed}`\n"
+        f"Total groups in DB: `{total}`\n\n"
+        f"⚠️ Telegram does not provide a list of all groups the bot joined.\n"
+        f"Use `/registergroup <CHAT_ID>` to manually add missing groups."
+    )
+
+
+
+
+
+# ============ DATABASE INTEGRITY & BACKUP ============
+
+BACKUP_DIR = "backups"
+BACKUP_META_FILE = "backup_status.json"
+
+
+def init_backup_dir():
+    """Ensure the backup directory exists."""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ Backup dir init failed: {e}", flush=True)
+
+
+def load_backup_status():
+    """Load backup metadata."""
+    try:
+        with open(BACKUP_META_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {"last_backup": None, "backup_count": 0, "last_error": None}
+
+
+def save_backup_status(status):
+    """Save backup metadata."""
+    try:
+        with open(BACKUP_META_FILE, 'w') as f:
+            json.dump(status, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Backup status write failed: {e}", flush=True)
+
+
+def verify_database_integrity():
+    """Verify SQLite database integrity. Returns (ok, message)."""
+    try:
+        with GROUP_DB_LOCK:
+            conn = sqlite3.connect(GROUP_DB_FILE)
+            cur = conn.cursor()
+            cur.execute("PRAGMA integrity_check")
+            result = cur.fetchone()
+            conn.close()
+        if result and result[0] == "ok":
+            return True, "Database integrity check passed"
+        return False, f"Integrity check failed: {result}"
+    except Exception as e:
+        return False, f"Integrity check error: {e}"
+
+
+def create_backup():
+    """Create a timestamped backup of all persistent data files."""
+    init_backup_dir()
+    status = load_backup_status()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_files = []
+
+    files_to_backup = [
+        DATA_FILES['allowed'],
+        DATA_FILES['stats'],
+        DATA_FILES['users'],
+        DATA_FILES['config'],
+        BROADCAST_FILE,
+        LIKE_LOG_FILE,
+        GROUP_DB_FILE,
+    ]
+
+    for src in files_to_backup:
+        if not os.path.exists(src):
+            continue
+        try:
+            dst = os.path.join(BACKUP_DIR, f"{timestamp}_{os.path.basename(src)}")
+            import shutil
+            shutil.copy2(src, dst)
+            backup_files.append(os.path.basename(src))
+        except Exception as e:
+            print(f"⚠️ Backup copy failed for {src}: {e}", flush=True)
+
+    status["last_backup"] = timestamp
+    status["backup_count"] = status.get("backup_count", 0) + 1
+    status["last_error"] = None
+    status["files"] = backup_files
+    save_backup_status(status)
+
+    # Also push backup status to GitHub
+    if github_persistence:
+        try:
+            github_persistence.queue_push('config')
+        except Exception:
+            pass
+
+    return timestamp, backup_files
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a database backup. Admin only."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    # Verify integrity first
+    ok, msg = verify_database_integrity()
+    if not ok:
+        await reply(update, f"❌ Database integrity check failed:\n{msg}")
+        return
+
+    try:
+        timestamp, files = create_backup()
+        await reply(
+            update,
+            f"✅ *Backup Created*\n\n"
+            f"🕒 Timestamp: `{timestamp}`\n"
+            f"📁 Files: `{', '.join(files)}`\n"
+            f"📍 Location: `{BACKUP_DIR}/`"
+        )
+    except Exception as e:
+        await reply(update, f"❌ Backup failed: `{type(e).__name__}: {e}`")
+
+
+async def backupstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show backup status. Admin only."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    status = load_backup_status()
+    ok, integrity_msg = verify_database_integrity()
+
+    await reply(
+        update,
+        f"💾 *Backup Status*\n\n"
+        f"🔍 Integrity: {'✅ OK' if ok else '❌ FAILED'}\n"
+        f"   {integrity_msg}\n"
+        f"🕒 Last Backup: `{status.get('last_backup') or 'Never'}`\n"
+        f"📦 Backup Count: `{status.get('backup_count', 0)}`\n"
+        f"❌ Last Error: `{status.get('last_error') or 'None'}`\n"
+        f"📁 Backup Dir: `{BACKUP_DIR}/`"
+    )
+
+
+async def group_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button callbacks for group management."""
+    if not await force_join_check(update, context): return
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if not is_admin(user_id):
+        try:
+            await query.edit_message_text("❌ Admin only")
+        except Exception:
+            pass
+        return
+
+    data = query.data
+
+    # Parse callback: group_allow_{chat_id}, group_block_{chat_id}, group_details_{chat_id}, groups_page_{page}
+    parts = data.split("_")
+    if len(parts) < 3:
+        return
+
+    action = parts[0] + "_" + parts[1]  # group_allow, group_block, group_details, groups_page
+
+    if action == "group_allow":
+        chat_id = int(parts[2])
+        set_group_status(chat_id, 'allowed')
+        allowed_groups[str(chat_id)] = {'name': '', 'by': user_id, 'date': today_str()}
+        save_all()
+        detail = get_group_detail(chat_id)
+        title = detail.get('chat_title', 'Unknown') if detail else 'Unknown'
+        try:
+            await query.edit_message_text(
+                f"✅ *Group Allowed*\n\n"
+                f"📢 Chat ID: `{chat_id}`\n"
+                f"📝 Title: {title}\n"
+                f"Users can now use like commands in this group.",
+                parse_mode='Markdown'
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+
+    elif action == "group_block":
+        chat_id = int(parts[2])
+        set_group_status(chat_id, 'blocked')
+        allowed_groups.pop(str(chat_id), None)
+        save_all()
+        detail = get_group_detail(chat_id)
+        title = detail.get('chat_title', 'Unknown') if detail else 'Unknown'
+        try:
+            await query.edit_message_text(
+                f"🔴 *Group Blocked*\n\n"
+                f"📢 Chat ID: `{chat_id}`\n"
+                f"📝 Title: {title}\n"
+                f"Normal users cannot use like commands. Admin commands still work.",
+                parse_mode='Markdown'
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+
+    elif action == "group_details":
+        chat_id = int(parts[2])
+        detail = get_group_detail(chat_id)
+        if not detail:
+            try:
+                await query.edit_message_text("❌ Group not found in database.")
+            except Exception:
+                pass
+            return
+        status = detail.get('status', 'allowed')
+        status_emoji = "🟢" if status == 'allowed' else ("🔴" if status == 'blocked' else "⚪")
+        added = (detail.get('added_at') or 'Unknown')[:10]
+        updated = (detail.get('updated_at') or 'Unknown')[:16]
+        try:
+            await query.edit_message_text(
+                f"ℹ️ *Group Details*\n\n"
+                f"📢 Title: {detail.get('chat_title', 'Unknown')}\n"
+                f"🆔 Chat ID: `{detail.get('chat_id')}`\n"
+                f"📛 Username: @{detail.get('chat_username') or '-'}\n"
+                f"📁 Type: {detail.get('chat_type', 'group')}\n"
+                f"{status_emoji} Status: {status.upper()}\n"
+                f"🤖 Bot Member: {detail.get('bot_member_status', 'unknown')}\n"
+                f"📅 Added: {added}\n"
+                f"🔄 Updated: {updated}",
+                parse_mode='Markdown'
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+
+    elif action == "groups_page":
+        page = int(parts[2])
+        # Re-show the groups list at the given page
+        groups = get_all_groups()
+        if not groups:
+            try:
+                await query.edit_message_text("No groups registered.")
+            except Exception:
+                pass
+            return
+
+        counts = get_group_count_by_status()
+        total = len(groups)
+        per_page = 10
+        total_pages = (total + per_page - 1) // per_page
+        if page >= total_pages:
+            page = total_pages - 1
+        if page < 0:
+            page = 0
+
+        start = page * per_page
+        end = start + per_page
+        page_groups = groups[start:end]
+
+        msg = (
+            "👥 *Group Management*\n\n"
+            f"📊 Total: `{total}` | 🟢 Allowed: `{counts.get('allowed', 0)}` | "
+            f"🔴 Blocked: `{counts.get('blocked', 0)}` | ⚪ Inactive: `{counts.get('inactive', 0)}`\n"
+            f"📄 Page `{page + 1}` of `{total_pages}`\n\n"
+        )
+
+        for g in page_groups:
+            cid = g['chat_id']
+            title = g.get('chat_title') or 'Unknown'
+            username = g.get('chat_username') or '-'
+            ctype = g.get('chat_type') or 'group'
+            status = g.get('status', 'allowed')
+            added = (g.get('added_at') or 'Unknown')[:10]
+
+            status_emoji = "🟢" if status == 'allowed' else ("🔴" if status == 'blocked' else "⚪")
+            status_text = status.upper()
+
+            msg += (
+                f"{status_emoji} *{title}*\n"
+                f"   ID: `{cid}` | Type: {ctype} | Status: {status_text}\n"
+                f"   Username: @{username} | Added: {added}\n\n"
+            )
+
+        keyboard = []
+        for g in page_groups:
+            cid = g['chat_id']
+            status = g.get('status', 'allowed')
+            allow_btn_text = "✅ ALLOW" if status != 'allowed' else "✅ ALLOWED"
+            block_btn_text = "🔴 BLOCK" if status != 'blocked' else "🔴 BLOCKED"
+            keyboard.append([
+                InlineKeyboardButton(allow_btn_text, callback_data=f"group_allow_{cid}"),
+                InlineKeyboardButton(block_btn_text, callback_data=f"group_block_{cid}"),
+                InlineKeyboardButton("ℹ️ DETAILS", callback_data=f"group_details_{cid}"),
+            ])
+
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"groups_page_{page - 1}"))
+        if end < total:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"groups_page_{page + 1}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+
+        try:
+            await query.edit_message_text(
+                msg,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+
+
+async def register_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """TypeHandler: runs for every update, before command handlers."""
+    register_chat(update)
+
+
+def log_successful_like(uid, region, likes_given, before, after, user_id):
+    """Log a successful like to the log file."""
+    try:
+        with open(LIKE_LOG_FILE, "r") as f:
+            data = json.load(f)
+    except Exception:
+        data = {"likes": []}
+
+    data["likes"].append({
+        "target_uid": uid,
+        "region": region,
+        "likes_given": likes_given,
+        "before": before,
+        "after": after,
+        "requested_by": user_id,
+        "timestamp": str(date.today())
+    })
+
+    with open(LIKE_LOG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+    # Also log to per-user history
+    try:
+        try:
+            with open(LIKE_HISTORY_FILE, "r") as f:
+                history = json.load(f)
+        except Exception:
+            history = {}
+        suid = str(user_id)
+        if suid not in history:
+            history[suid] = []
+        history[suid].append({
+            "target_uid": uid,
+            "region": region,
+            "likes_given": likes_given,
+            "before": before,
+            "after": after,
+            "timestamp": str(date.today())
+        })
+        # Keep only last 50 entries per user
+        history[suid] = history[suid][-50:]
+        with open(LIKE_HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Like history save failed: {e}", flush=True)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only command")
+        return
+
+    document = update.message.document
+    if not document:
+        await reply(update, "❌ No document found.")
+        return
+
+    file_name = document.file_name or ""
+    if not file_name.endswith(".json"):
+        await reply(update, "❌ Please upload a valid JSON file.")
+        return
+
+    try:
+        file = await context.bot.get_document(document.file_id)
+        file_bytes = await file.download_as_bytearray()
+
+        try:
+            new_tokens = json.loads(file_bytes.decode('utf-8'))
+        except Exception as e:
+            await reply(update, f"❌ Invalid JSON file: `{str(e)[:100]}`")
+            return
+
+        # Forward tokens to API's /upload-tokens endpoint
+        upload_url = f"{API_URL.rstrip('/')}/upload-tokens"
+        payload = {"tokens": new_tokens}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(upload_url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                result = await resp.json()
+
+        if resp.status == 200:
+            await reply(update,
+                f"✅ Token Update Complete\n\n"
+                f"✅ Added: {result.get('added', 0)}\n"
+                f"❌ Expired: {result.get('expired', 0)}\n"
+                f"📁 Total in bank: {result.get('total_in_bank', 0)}"
+            )
+        else:
+            error_msg = result.get("error", "Unknown error") if isinstance(result, dict) else str(result)
+            await reply(update, f"❌ API Error: `{error_msg}`")
+
+    except Exception as e:
+        await reply(update, f"❌ Error processing file: `{str(e)[:100]}`")
+
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast an exact message to every registered user and group. Admin only."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    if not context.args:
+        await reply(update, "❌ Usage: `/broadcast <message>`\nExample: `/broadcast Hello everyone!`")
+        return
+
+    # Preserve the exact text, including newlines and formatting.
+    raw_text = (update.message.text or "") if update.message else ""
+    parts = raw_text.split(None, 1)
+    message = parts[1] if len(parts) > 1 else " ".join(context.args)
+    if not message.strip():
+        await reply(update, "❌ Broadcast message is empty.")
+        return
+
+    data = _load_broadcast_data()
+    user_targets = []
+    group_targets = []
+    seen = set()
+    for raw_id in data.get("users", {}).keys():
+        try:
+            chat_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if chat_id in seen:
+            continue
+        seen.add(chat_id)
+        user_targets.append(chat_id)
+    for raw_id in data.get("chats", {}).keys():
+        try:
+            chat_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if chat_id in seen:
+            continue
+        seen.add(chat_id)
+        group_targets.append(chat_id)
+
+    if not user_targets and not group_targets:
+        await reply(
+            update,
+            "❌ No registered users or groups yet.\n\n"
+            "Recipients are added automatically when the bot is added to a group "
+            "(my_chat_member) or when someone sends /start /info /like. "
+            "Admins can also use /registergroup <CHAT_ID> to manually add groups."
+        )
+        return
+
+    total_targets = len(user_targets) + len(group_targets)
+    sent = 0
+    failed = 0
+    failed_ids = []
+
+    all_targets = user_targets + group_targets
+    for chat_id in all_targets:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=message)
+            sent += 1
+        except RetryAfter as e:
+            try:
+                await asyncio.sleep(min(int(getattr(e, "retry_after", 1)), 5))
+                await context.bot.send_message(chat_id=chat_id, text=message)
+                sent += 1
+            except Exception:
+                failed += 1
+                failed_ids.append(chat_id)
+        except Exception as e:
+            failed += 1
+            failed_ids.append(chat_id)
+            print(f"⚠️ Broadcast failed for {chat_id}: {e}", flush=True)
+
+    report = (
+        "📢 *Broadcast Report*\n\n"
+        f"👤 Total Private Users: `{len(user_targets)}`\n"
+        f"👥 Total Groups: `{len(group_targets)}`\n"
+        f"📡 Total Recipients: `{total_targets}`\n"
+        f"✅ Successful Deliveries: `{sent}`\n"
+        f"❌ Failed Deliveries: `{failed}`"
+    )
+    if failed_ids:
+        report += "\n\n*Failed chat IDs:*\n" + "\n".join(f"`{i}`" for i in failed_ids[:20])
+    await reply(update, report)
+
+# ============ ADMIN COMMANDS ============
+async def allow_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ *Admin only command*")
+        return
+    chat = update.effective_chat
+    if chat.type == "private":
+        await reply(update, "❌ Use this command in a group")
+        return
+    gid = str(chat.id)
+    allowed_groups[gid] = {'name': chat.title, 'by': update.effective_user.id, 'date': today_str()}
+    save_all()
+    await reply(update, f"✅ *Group allowed*\n{chat.title}\nBot will now work here (if private mode)")
+
+async def off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global bot_status
+    bot_status = "off"
+    save_all()
+    await reply(update, "🔴 *Bot is now OFF* (no commands work)")
+
+async def on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global bot_status
+    bot_status = "on"
+    save_all()
+    await reply(update, "🟢 *Bot is now ON*")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await force_join_check(update, context):
+        return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    t = today_str()
+    if t not in daily_stats:
+        await reply(update, "📊 *No stats for today*")
+        return
+    total = daily_stats[t]['total']
+    users_count = len(daily_stats[t]['users'])
+    msg = (
+        f"📊 *𝑻𝑶𝑫𝑨𝒀'𝑺 𝑺𝑻𝑨𝑻𝑺*\n\n"
+        f"📅 Date: `{t}`\n"
+        f"❤️ Total likes sent: `{total}`\n"
+        f"👥 Users: `{users_count}`\n"
+        f"⚙️ Limit per user: `{daily_limit}`\n"
+        f"🎯 Mode: `{bot_mode.upper()}`"
+    )
+    await reply(update, msg)
+
+async def set_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global bot_mode
+    bot_mode = "private"
+    save_all()
+    await reply(update, "🔒 *Bot is now PRIVATE* – works only in allowed groups")
+
+async def set_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global bot_mode
+    bot_mode = "public"
+    save_all()
+    await reply(update, "🌍 *Bot is now PUBLIC* – works in all groups")
+
+async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await reply(update, "❌ Usage: `/setlimit <number>`\nExample: `/setlimit 5`")
+        return
+    global daily_limit
+    daily_limit = int(context.args[0])
+    save_all()
+    await reply(update, f"✅ *Daily limit set to `{daily_limit}` likes per user*")
+
+
+# ============ VIP USER COMMANDS ============
+async def addvip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a VIP user (unlimited likes, private access): /addvip <user_id>"""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await reply(update, "❌ Usage: `/addvip <user_id>`\nExample: `/addvip 7176002628`")
+        return
+    uid = int(context.args[0])
+    vip_users.add(uid)
+    save_all()
+    await reply(update, f"✅ User `{uid}` added to VIP list. Unlimited likes enabled.")
+
+
+async def removevip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a VIP user: /removevip <user_id>"""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await reply(update, "❌ Usage: `/removevip <user_id>`")
+        return
+    uid = int(context.args[0])
+    vip_users.discard(uid)
+    save_all()
+    await reply(update, f"✅ User `{uid}` removed from VIP list.")
+
+
+async def vipstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check your VIP status: /vipstatus"""
+    if not await force_join_check(update, context): return
+    uid = update.effective_user.id
+    if is_vip(uid):
+        cap = get_vip_limit(uid)
+        if cap:
+            used = vip_usage(uid)
+            await reply(
+                update,
+                f"👑 *VIP Status: ACTIVE*\n"
+                f"💎 Daily limit: `{cap}` likes (used {used}/{cap})\n"
+                f"⏰ Resets at Bangladesh midnight\n"
+                f"💬 Private chat access enabled"
+            )
+        else:
+            await reply(update, "👑 *VIP Status: ACTIVE*\n🔥 Unlimited likes – No daily limit.\n💬 Private chat access enabled.")
+    else:
+        await reply(update, f"📋 *VIP Status: INACTIVE*\nYou are not a VIP user. Daily limit: `{daily_limit}` likes.\nAsk the bot admin to add you with `/addvip {uid}`.")
+
+
+async def vipusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all VIP users (admin only): /vipusers"""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if not vip_users:
+        await reply(update, "📭 No VIP users found.")
+        return
+    msg = "👑 *VIP USERS*\n\n"
+    default_cap = int(vip_limits.get("default", 0) or 0)
+    for i, uid in enumerate(sorted(vip_users), 1):
+        cap = get_vip_limit(uid)
+        used = vip_usage(uid)
+        limit_txt = "unlimited" if not cap else f"{cap} (used {used})"
+        override = "✏️" if str(uid) in (vip_limits.get("users", {}) or {}) else ""
+        msg += f"{i}. `{uid}` — limit: {limit_txt} {override}\n"
+    msg += f"\nDefault limit: {'unlimited' if not default_cap else default_cap}"
+    msg += f"\nTotal: {len(vip_users)} VIP user(s)"
+    await reply(update, msg)
+
+
+async def viplimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the daily like limit for VIP users (admin only).
+
+    /viplimit                     -> show current limits + usage
+    /viplimit all <n>             -> default limit for every VIP (0 = unlimited)
+    /viplimit <user_id> <n>       -> that VIP's limit (0 = unlimited)
+    /viplimit reset <user_id>     -> remove override, back to default
+    /viplimit resetall            -> clear every override
+    """
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    global vip_limits
+    args = context.args or []
+
+    # --- show current settings ---
+    if not args:
+        default_cap = int(vip_limits.get("default", 0) or 0)
+        msg = (
+            "💎 *VIP LIKE LIMITS*\n\n"
+            f"Default limit: {'unlimited' if not default_cap else default_cap}\n\n"
+        )
+        if not vip_users:
+            msg += "📭 No VIP users found."
+        else:
+            for i, uid in enumerate(sorted(vip_users), 1):
+                cap = get_vip_limit(uid)
+                used = vip_usage(uid)
+                limit_txt = "unlimited" if not cap else f"{cap} (used {used}/{cap})"
+                override = "  ✏️ own" if str(uid) in (vip_limits.get("users", {}) or {}) else ""
+                msg += f"{i}. `{uid}` — {limit_txt}{override}\n"
+        msg += (
+            "\n*Usage*\n"
+            "`/viplimit all <n>` — default for all VIPs (0 = unlimited)\n"
+            "`/viplimit <user_id> <n>` — one VIP's limit (0 = unlimited)\n"
+            "`/viplimit reset <user_id>` — back to default\n"
+            "`/viplimit resetall` — clear all overrides"
+        )
+        await reply(update, msg)
+        return
+
+    cmd = args[0].lower()
+
+    # --- clear everything ---
+    if cmd == "resetall":
+        vip_limits["users"] = {}
+        save_all()
+        await reply(update, "✅ All VIP limit overrides cleared. Every VIP now uses the default limit.")
+        return
+
+    # --- reset one VIP ---
+    if cmd == "reset":
+        if len(args) != 2 or not args[1].isdigit():
+            await reply(update, "❌ Usage: `/viplimit reset <user_id>`")
+            return
+        uid = int(args[1])
+        clear_vip_limit(uid)
+        save_all()
+        cap = get_vip_limit(uid)
+        await reply(
+            update,
+            f"✅ Override removed for `{uid}`.\n"
+            f"💎 Limit now: {'unlimited' if not cap else cap} (default)"
+        )
+        return
+
+    # --- default for all VIPs ---
+    if cmd == "all":
+        if len(args) != 2 or not args[1].isdigit():
+            await reply(update, "❌ Usage: `/viplimit all <n>`\nExample: `/viplimit all 50`\n(0 = unlimited)")
+            return
+        limit = int(args[1])
+        if limit > 10000:
+            await reply(update, "❌ Limit too high (max 10000)")
+            return
+        set_vip_default_limit(limit)
+        save_all()
+        await reply(
+            update,
+            f"✅ Default VIP limit set to **{'unlimited' if limit == 0 else limit}** likes/day.\n"
+            f"👥 {len(vip_users)} VIP user(s) affected (per-VIP overrides still win)."
+        )
+        return
+
+    # --- one VIP ---
+    if len(args) != 2 or not args[0].isdigit() or not args[1].isdigit():
+        await reply(
+            update,
+            "❌ Usage:\n"
+            "`/viplimit <user_id> <n>` — one VIP's limit (0 = unlimited)\n"
+            "`/viplimit all <n>` — default for all VIPs\n"
+            "`/viplimit reset <user_id>` — back to default\n"
+            "`/viplimit resetall` — clear all overrides"
+        )
+        return
+    uid, limit = int(args[0]), int(args[1])
+    if limit > 10000:
+        await reply(update, "❌ Limit too high (max 10000)")
+        return
+    if uid not in vip_users:
+        await reply(update, f"⚠️ User `{uid}` is not a VIP. Add them with `/addvip {uid}` first.")
+        return
+    set_vip_limit(uid, limit)
+    save_all()
+    used = vip_usage(uid)
+    await reply(
+        update,
+        f"✅ VIP limit set for `{uid}`\n\n"
+        f"💎 Daily limit: **{'unlimited' if limit == 0 else limit}** likes\n"
+        f"📊 Used today: {used}"
+    )
+
+
+# ============ LIKE HISTORY COMMAND ============
+async def likehistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View your like history: /likehistory [UID]"""
+    if not await force_join_check(update, context): return
+    user_id = update.effective_user.id
+    target_uid = None
+    if context.args and context.args[0].isdigit():
+        target_uid = int(context.args[0])
+        if not is_admin(user_id) and not is_vip(user_id):
+            await reply(update, "❌ Admin/VIP only can check other users' history!")
+            return
+
+    suid = str(target_uid if target_uid else user_id)
+    try:
+        with open(LIKE_HISTORY_FILE, "r") as f:
+            history = json.load(f)
+    except Exception:
+        history = {}
+
+    user_history = history.get(suid, [])
+    if not user_history:
+        await reply(update, f"📭 No like history found for UID `{suid}`.")
+        return
+
+    msg = f"📜 *LIKE HISTORY — UID `{suid}`*\n\n"
+    for entry in user_history[-10:]:
+        msg += (
+            f"🎯 Target: `{entry['target_uid']}` | Region: {entry['region']}\n"
+            f"❤️ Likes: +{entry['likes_given']} ({entry['before']} → {entry['after']})\n"
+            f"📅 Date: {entry['timestamp']}\n"
+            f"────────────────────\n"
+        )
+    msg += f"\nTotal records: {len(user_history)} (showing last 10)"
+    await reply(update, msg)
+
+
+# ============ DAILY REPORT COMMAND ============
+async def dailyreport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send daily report (admin only): /dailyreport"""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    t = today_str()
+    if t not in daily_stats or daily_stats[t]['total'] == 0:
+        await reply(update, f"📊 No like activity recorded for today ({t}).")
+        return
+    total = daily_stats[t]['total']
+    users_count = len(daily_stats[t]['users'])
+    top_users = sorted(daily_stats[t]['users'].items(), key=lambda x: x[1], reverse=True)[:5]
+    msg = (
+        f"📊 *DAILY REPORT — {t}*\n\n"
+        f"❤️ Total likes sent: `{total}`\n"
+        f"👥 Active users: `{users_count}`\n"
+        f"⚙️ Daily limit per user: `{daily_limit}`\n"
+        f"🔢 Tokens per request: `{like_tokens}`\n"
+        f"🤖 Bot status: `{bot_status.upper()}`\n"
+        f"🔒 Mode: `{bot_mode.upper()}`\n\n"
+        f"🏆 *TOP USERS TODAY:*\n"
+    )
+    for i, (uid, cnt) in enumerate(top_users, 1):
+        msg += f"{i}. UID `{uid}` — `{cnt}` likes\n"
+    msg += f"\n🔥 Credits: @CATS_AI_solayman"
+    await reply(update, msg)
+
+
+# ============ WELCOME/GOODBYE COMMANDS ============
+async def setwelcome_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set custom welcome message (admin only): /setwelcome <text>"""
+    if not await force_join_check(update, context): return
+    global welcome_msg
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if not context.args:
+        await reply(update, f"📝 Current welcome: *{welcome_msg}*\nUsage: `/setwelcome <your text>`")
+        return
+    welcome_msg = " ".join(context.args)
+    save_all()
+    await reply(update, f"✅ Welcome message updated!\n📝 *{welcome_msg}*")
+
+
+async def setgoodbye_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set custom goodbye message (admin only): /setgoodbye <text>"""
+    if not await force_join_check(update, context): return
+    global goodbye_msg
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if not context.args:
+        await reply(update, f"📝 Current goodbye: *{goodbye_msg}*\nUsage: `/setgoodbye <your text>`")
+        return
+    goodbye_msg = " ".join(context.args)
+    save_all()
+    await reply(update, f"✅ Goodbye message updated!\n📝 *{goodbye_msg}*")
+
+
+# ============ LANGUAGE COMMAND ============
+async def setlang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set your language: /setlang en or /setlang bn"""
+    if not await force_join_check(update, context): return
+    user_id = update.effective_user.id
+    if not context.args or context.args[0].lower() not in ("en", "bn"):
+        await reply(update, "🌐 Choose language: `/setlang en` or `/setlang bn`")
+        return
+    user_lang[user_id] = context.args[0].lower()
+    save_all()
+    lang_name = "English" if user_lang[user_id] == "en" else "Bangla"
+    await reply(update, f"✅ Language set to: *{lang_name}*")
+
+
+# ============ LEADERBOARD COMMAND ============
+async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View top users by likes today: /leaderboard"""
+    if not await force_join_check(update, context): return
+    t = today_str()
+    if t not in daily_stats or daily_stats[t]['total'] == 0:
+        await reply(update, f"📊 No like activity recorded for today ({t}).")
+        return
+    top_users = sorted(daily_stats[t]['users'].items(), key=lambda x: x[1], reverse=True)[:10]
+    msg = f"🏆 *LEADERBOARD — {t}*\n\n"
+    for i, (uid, cnt) in enumerate(top_users, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🔹"
+        msg += f"{medal} #{i} UID `{uid}` — `{cnt}` likes\n"
+    msg += f"\n🔥 Total likes today: `{daily_stats[t]['total']}`\n👑 Credits: @CATS_AI_solayman"
+    await reply(update, msg)
+
+
+# ============ AUTO LIKE ANNOUNCEMENT COMMANDS ============
+async def setautolikechannel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the channel for auto-like announcements: /setautolikechannel @channel"""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if len(context.args) != 1:
+        await reply(update, "❌ Usage: `/setautolikechannel @channel`\nExample: `/setautolikechannel @autolikespro`")
+        return
+    global AUTO_LIKE_CHANNEL_ID
+    AUTO_LIKE_CHANNEL_ID = context.args[0].strip()
+    save_all()
+    await reply(update, f"✅ Auto-like announcement channel set to: `{AUTO_LIKE_CHANNEL_ID}`")
+
+
+async def setautolikegroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the group for auto-like announcements: /setautolikegroup <group_id>"""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if len(context.args) != 1:
+        await reply(update, "❌ Usage: `/setautolikegroup <group_id>`\nExample: `/setautolikegroup -1001234567890`")
+        return
+    try:
+        gid = int(context.args[0].strip())
+    except ValueError:
+        await reply(update, "❌ Group ID must be a number (e.g., -1001234567890)")
+        return
+    global AUTO_LIKE_GROUP_ID
+    AUTO_LIKE_GROUP_ID = gid
+    save_all()
+    await reply(update, f"✅ Auto-like announcement group set to: `{AUTO_LIKE_GROUP_ID}`")
+
+
+async def autolikeannouncestatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show auto-like announcement configuration: /autolikeannouncestatus"""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    enabled = "✅ ON" if AUTO_LIKE_BROADCAST_ENABLED else "❌ OFF"
+    ch = AUTO_LIKE_CHANNEL_ID or "Not set"
+    grp = AUTO_LIKE_GROUP_ID or "Not set"
+    msg = (
+        "📢 *AUTO LIKE ANNOUNCEMENT STATUS*\n\n"
+        f"🔔 Broadcast: {enabled}\n"
+        f"📺 Channel: `{ch}`\n"
+        f"👥 Group: `{grp}`\n\n"
+        "Use `/setautolikechannel @channel` and `/setautolikegroup <group_id>` to configure."
+    )
+    await reply(update, msg)
+
+
+# ============ LIKE MODE COMMANDS ============
+async def set_api_100(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """100-token mode (~100-110 likes per request)."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global like_tokens
+    like_tokens = 100
+    save_all()
+    await reply(update,
+                "✅ *API 100 mode ON*\n\n"
+                "🔢 Tokens per request: `100`\n"
+                "❤️ Expected likes: `~100-110`\n\n"
+                "Now send `/like BD UID`")
+
+
+# ============ FORCE JOIN COMMANDS ============
+import re
+
+
+def _extract_username_from_link(link: str) -> str:
+    """Extract channel username from a Telegram link.
+
+    Supports:
+      https://t.me/USERNAME      -> @USERNAME
+      https://t.me/+INVITEHASH   -> +INVITEHASH (private invite, kept as-is)
+      https://t.me/joinchat/...  -> kept as-is
+      @USERNAME                  -> @USERNAME
+      USERNAME                   -> @USERNAME
+    """
+    if not link:
+        return ""
+    link = link.strip()
+
+    # Already a username
+    if link.startswith("@"):
+        return link
+
+    # Parse t.me links FIRST (before isalnum check, since URLs may contain _)
+    if link.lower().startswith(("http://", "https://", "tg://")):
+        m = re.match(r"^https?://t\.me/(.+)$", link, re.IGNORECASE)
+        if m:
+            path = m.group(1)
+            if path.startswith("+"):
+                # Private invite link — keep as-is for the Join button
+                return path
+            if path.startswith("joinchat/"):
+                return path
+            return "@" + path
+        # Not a t.me link, return as-is
+        return link
+
+    # Bare username or invite hash
+    if link.startswith("+") or link.startswith("-"):
+        return link
+    if link.isalnum() or "_" in link:
+        return "@" + link
+
+    return link
+
+
+def _migrate_force_join_channels():
+    """Migrate existing force_join_channels to valid Telegram identifiers.
+
+    Old data may contain:
+      - URLs like @https://t.me/FFAUTOLIKESPRO1 -> @FFAUTOLIKESPRO1
+      - URLs like https://t.me/FFAUTOLIKESPRO1 -> @FFAUTOLIKESPRO1
+      - Invite links stored as IDs like +HASH -> move to links
+      - Placeholder names
+    """
+    global force_join_channels, force_join_links, force_join_group_titles, force_join_group_usernames
+    migrated = False
+    new_channels = []
+    new_links = {}
+    new_titles = {}
+    new_usernames = {}
+
+    for ch in force_join_channels:
+        link = force_join_links.get(str(ch), "") or ""
+        title = force_join_group_titles.get(str(ch), ch)
+        username = force_join_group_usernames.get(str(ch), "")
+
+        # Normalize the channel ID using the existing normalizer
+        normalized = _normalize_channel(ch)
+
+        # If the normalized value is different from the current ID, migrate
+        if normalized and normalized != ch:
+            print(f"🔄 Migrating force-join ID '{ch}' -> '{normalized}'", flush=True)
+            new_channels.append(normalized)
+            new_links[normalized] = link
+            new_titles[normalized] = title
+            new_usernames[normalized] = username
+            migrated = True
+            continue
+
+        # If ch looks like a URL (@https://t.me/...), extract from it
+        if ch.startswith("@https://") or ch.startswith("https://"):
+            extracted = _normalize_channel(ch)
+            if extracted and extracted != ch:
+                print(f"🔄 Migrating force-join URL '{ch}' -> '{extracted}'", flush=True)
+                new_channels.append(extracted)
+                new_links[extracted] = link
+                new_titles[extracted] = title
+                new_usernames[extracted] = username
+                migrated = True
+                continue
+
+        new_channels.append(ch)
+        if link:
+            new_links[str(ch)] = link
+        if title:
+            new_titles[str(ch)] = title
+        if username:
+            new_usernames[str(ch)] = username
+
+    if migrated:
+        force_join_channels = new_channels
+        force_join_links = new_links
+        force_join_group_titles = new_titles
+        force_join_group_usernames = new_usernames
+        save_all()
+        print(f"✅ Force-join migration complete: {len(force_join_channels)} group(s)", flush=True)
+
+
+def _normalize_channel(value: str) -> str:
+    """Normalize a channel value: strip whitespace, extract username from links.
+
+    Supports:
+      https://t.me/USERNAME      -> @USERNAME
+      https://t.me/+INVITEHASH   -> +INVITEHASH
+      https://t.me/joinchat/...  -> +joinchat_hash
+      @https://t.me/USERNAME     -> @USERNAME  (strip @, then parse URL)
+      @USERNAME                  -> @USERNAME
+      USERNAME                   -> @USERNAME
+      +INVITEHASH                -> +INVITEHASH
+      -1001234567890             -> -1001234567890
+    """
+    value = (value or "").strip()
+    if not value:
+        return value
+
+    # If value starts with @ followed by a URL, strip the @ and process as URL
+    if value.startswith("@http") or value.startswith("@tg://") or value.startswith("@t.me/"):
+        value = value[1:]  # Strip leading @
+
+    # If it's a t.me link, extract the username/invite hash
+    if value.lower().startswith(("http://", "https://", "tg://")):
+        extracted = _extract_username_from_link(value)
+        if extracted:
+            return extracted
+        # Fallback: try to extract from URL manually
+        import re as _re
+        m = _re.match(r"^https?://t\.me/(.+)$", value, _re.IGNORECASE)
+        if m:
+            path = m.group(1)
+            if path.startswith("+"):
+                return path
+            return "@" + path
+        return value
+
+    # If it's already a username, invite hash, or chat ID, return as-is
+    if value.startswith("@") or value.startswith("+") or value.startswith("-"):
+        return value
+
+    # If it's a bare username without @, add it
+    if value.isalnum() or "_" in value:
+        return "@" + value
+
+    return value
+
+
+def _find_channel_index(channel: str) -> int:
+    """Find a configured channel by exact or case-insensitive username match."""
+    for i, existing in enumerate(force_join_channels):
+        if existing == channel:
+            return i
+    target = channel.lower().lstrip("@")
+    for i, existing in enumerate(force_join_channels):
+        if existing.lower().lstrip("@") == target:
+            return i
+    return -1
+
+
+def _format_force_join_list() -> str:
+    if not force_join_channels:
+        return "  None configured"
+    lines = []
+    for i, gid in enumerate(force_join_channels, start=1):
+        link = force_join_links.get(gid, "") or "No link set"
+        title = force_join_group_titles.get(gid, gid)
+        username = force_join_group_usernames.get(gid, "")
+        display = f"{title} ({username})" if username else title
+        lines.append(f"  {i}. {display}\n     🆔 `{gid}`\n     🔗 {link}")
+    return "\n".join(lines)
+
+
+async def _add_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a group or channel to the force-join list. Admin only.
+
+    Usage:
+      /addforcejointhisgroup              — inside a group/channel (auto-detects)
+      /addforcejointhisgroup @username    — add by channel/group username
+      /addforcejointhisgroup @username https://t.me/+invite  — add with custom link
+    """
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    global force_join
+    chat = update.effective_chat
+    chat_type = chat.type if chat else None
+
+    # If args provided, treat first arg as channel/group identifier
+    if context.args:
+        raw = context.args[0].strip()
+        # Use existing normalizer: @username, username, https://t.me/USERNAME, +INVITEHASH, etc.
+        gid = _normalize_channel(raw)
+
+        # If it's an invite hash (+...), resolve to real chat ID via get_chat
+        # so that get_chat_member works later.
+        is_invite_hash = gid.startswith("+") or gid.startswith("joinchat/")
+        custom_link = None
+        if is_invite_hash:
+            # Build the full invite link URL
+            if gid.startswith("+"):
+                custom_link = f"https://t.me/{gid}"
+            else:
+                custom_link = raw if raw.startswith(("http://", "https://", "tg://", "t.me/")) else f"https://t.me/{gid}"
+
+            # Try to resolve invite link to real chat ID
+            try:
+                chat_info = await context.bot.get_chat(chat_id=custom_link)
+                gid = str(chat_info.id)  # Use real numeric chat ID
+                chat_title = getattr(chat_info, "title", None) or gid
+                chat_username = getattr(chat_info, "username", None)
+                if chat_username and not chat_username.startswith("@"):
+                    chat_username = "@" + chat_username
+                print(f"🔄 Resolved invite link '{custom_link}' to chat ID '{gid}'", flush=True)
+            except Exception as e:
+                print(f"⚠️ Could not resolve invite link '{custom_link}': {e}", flush=True)
+                await reply(
+                    update,
+                    "❌ *Could Not Resolve Channel*\n\n"
+                    f"🆔 Input: `{raw}`\n"
+                    f"🔗 Link: `{custom_link}`\n\n"
+                    "Please make the bot an **administrator** in this channel/group first, "
+                    f"then try again.\n\n"
+                    "The bot needs admin rights to verify membership.",
+                )
+                return
+        else:
+            custom_link = None
+            if len(context.args) > 1:
+                custom_link = context.args[1].strip()
+
+        # Try to fetch chat info for title/username (only if we have a real chat ID)
+        chat_title = gid or raw
+        chat_username = None
+
+        if gid and not is_invite_hash:
+            try:
+                chat_info = await context.bot.get_chat(gid)
+                chat_title = getattr(chat_info, "title", None) or gid
+                chat_username = getattr(chat_info, "username", None)
+                if chat_username and not chat_username.startswith("@"):
+                    chat_username = "@" + chat_username
+            except Exception as e:
+                print(f"⚠️ Could not fetch chat info for {gid}: {e}", flush=True)
+                # If get_chat fails, try extracting username from the raw input
+                if raw.startswith("@"):
+                    chat_username = raw
+                elif raw.isalnum() or "_" in raw:
+                    chat_username = "@" + raw
+        elif gid and is_invite_hash:
+            # We already tried to get chat info via invite link above
+            pass
+        else:
+            # For invite hashes that couldn't be resolved
+            chat_title = raw
+            chat_username = None
+
+        # Determine invite link
+        invite_link = custom_link
+        if not invite_link and chat_username:
+            invite_link = f"https://t.me/{chat_username.lstrip("@")}"
+        if not invite_link and is_invite_hash and custom_link:
+            invite_link = custom_link
+
+        # Use the resolved gid as the ID
+        final_gid = gid
+
+        # Check for duplicate
+        if final_gid in force_join_channels:
+            force_join_links[final_gid] = invite_link or ""
+            force_join_group_titles[final_gid] = chat_title
+            force_join_group_usernames[final_gid] = chat_username or ""
+            action = "updated"
+        else:
+            force_join_channels.append(final_gid)
+            force_join_links[final_gid] = invite_link or ""
+            force_join_group_titles[final_gid] = chat_title
+            force_join_group_usernames[final_gid] = chat_username or ""
+            action = "added"
+
+        force_join = True
+        save_all()
+
+        note = "" if invite_link else "\n\n⚠️ No invite link available."
+        await reply(
+            update,
+            f"✅ *FORCE JOIN {action.upper()}*\n\n"
+            f"👥 Group/Channel: {chat_title}\n"
+            f"🆔 ID: `{final_gid}`\n"
+            f"🔢 Total Required: `{len(force_join_channels)}`\n"
+            f"🟢 Status: Enabled{note}"
+        )
+        return
+
+    # No args — auto-detect current chat (group, supergroup, or channel)
+    if not chat or chat_type not in ("group", "supergroup", "channel"):
+        await reply(
+            update,
+            "❌ This command must be used inside a group/channel, "
+            "or provide a username: `/addforcejointhisgroup @username`\n\n"
+            "The bot must be an administrator in that group/channel.",
+        )
+        return
+
+    gid = str(chat.id)
+    chat_title = chat.title or f"Group {chat.id}"
+    username = getattr(chat, "username", None)
+    if username and not username.startswith("@"):
+        username = "@" + username
+
+    # Try to generate an invite link (bot must be admin with invite link permission)
+    invite_link = None
+    try:
+        try:
+            existing = await context.bot.get_chat(chat.id)
+            invite_link = getattr(existing, "invite_link", None) or None
+        except Exception:
+            pass
+        if not invite_link:
+            new_link = await context.bot.create_chat_invite_link(chat.id)
+            invite_link = new_link.invite_link
+    except Exception as e:
+        print(f"⚠️ Could not generate invite link for {gid}: {e}", flush=True)
+        invite_link = None
+
+    # Check for duplicate
+    if gid in force_join_channels:
+        force_join_links[gid] = invite_link or ""
+        force_join_group_titles[gid] = chat_title
+        force_join_group_usernames[gid] = username or ""
+        action = "updated"
+    else:
+        force_join_channels.append(gid)
+        force_join_links[gid] = invite_link or ""
+        force_join_group_titles[gid] = chat_title
+        force_join_group_usernames[gid] = username or ""
+        action = "added"
+
+    force_join = True
+    save_all()
+
+    note = "" if invite_link else "\n\n⚠️ No invite link available. Make the bot admin with invite link permission."
+    await reply(
+        update,
+        f"✅ *FORCE JOIN {action.upper()}*\n\n"
+        f"👥 Group/Channel: {chat_title}\n"
+        f"🔢 Total Required: `{len(force_join_channels)}`\n"
+        f"🟢 Status: Enabled{note}"
+    )
+
+async def setforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add the first/another required channel."""
+    await _add_force_join(update, context)
+
+
+async def addforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add another required channel (alias of /setforcejoin)."""
+    await _add_force_join(update, context)
+
+
+async def removeforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove one required group, or all of them."""
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    global force_join
+    if len(context.args) < 1:
+        await reply(
+            update,
+            "❌ Usage:\n`/removeforcejoin <group_id_or_title>`\n"
+            "`/removeforcejoin all`\n\n"
+            "Example:\n`/removeforcejoin -1001234567890`\n"
+            "Use `/forcejoinlist` to see configured groups."
+        )
+        return
+
+    target = context.args[0].strip()
+
+    if target.lower() == "all":
+        count = len(force_join_channels)
+        force_join_channels.clear()
+        force_join_links.clear()
+        force_join_group_titles.clear()
+        force_join_group_usernames.clear()
+        force_join = False
+        save_all()
+        await reply(update, f"✅ *All Force Join Groups Removed*\n\nRemoved: `{count}`\n🟢 Force join: Disabled")
+        return
+
+    # Try to match by ID first, then by title
+    index = -1
+    for i, gid in enumerate(force_join_channels):
+        if gid == target:
+            index = i
+            break
+        if force_join_group_titles.get(gid, "").lower() == target.lower():
+            index = i
+            break
+
+    if index < 0:
+        await reply(update, f"❌ Group `{target}` is not in the force-join list.\n\nUse `/forcejoinlist` to see configured groups.")
+        return
+
+    removed_id = force_join_channels.pop(index)
+    removed_title = force_join_group_titles.pop(removed_id, removed_id)
+    force_join_links.pop(removed_id, None)
+    force_join_group_usernames.pop(removed_id, None)
+    if not force_join_channels:
+        force_join = False
+    save_all()
+    await reply(
+        update,
+        f"✅ *Force Join Group Removed*\n\n"
+        f"👥 Group: {removed_title}\n"
+        f"🆔 ID: `{removed_id}`\n"
+        f"🔢 Remaining required groups: `{len(force_join_channels)}`\n"
+        f"🟢 Force join: {'Enabled' if force_join else 'Disabled'}"
+    )
+
+
+async def addforcejointhisgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add current group/channel or by username to force-join list."""
+    await _add_force_join(update, context)
+
+
+async def clearforcejoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear all force-join groups after admin confirmation."""
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    global force_join
+    if context.args and context.args[0].lower() == "confirm":
+        count = len(force_join_channels)
+        force_join_channels.clear()
+        force_join_links.clear()
+        force_join_group_titles.clear()
+        force_join_group_usernames.clear()
+        force_join = False
+        save_all()
+        await reply(update, f"✅ *All Force Join Groups Cleared*\n\nRemoved: `{count}`\n🟢 Force join: Disabled")
+    else:
+        await reply(
+            update,
+            "⚠️ *Confirm Clear All Force Join Groups*\n\n"
+            "This will remove ALL required groups and disable force join.\n\n"
+            "Send `/clearforcejoin confirm` to proceed."
+        )
+
+
+async def forcejoinlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    await reply(
+        update,
+        f"📋 *Force Join Groups*\n\n"
+        f"🟢 Force join: {'Enabled' if force_join else 'Disabled'}\n"
+        f"🔢 Total: `{len(force_join_channels)}`\n\n"
+        f"{_format_force_join_list()}"
+    )
+
+
+async def forcejoinstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the real saved configuration and verify each group is reachable."""
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+
+    if not force_join_channels:
+        await reply(
+            update,
+            "📊 *Force Join Status*\n\n"
+            f"Status: {'✅ Enabled' if force_join else '❌ Disabled'}\n"
+            "Required groups: `0`\n\n"
+            "No groups configured. Add one with `/addforcejointhisgroup` from inside the group."
+        )
+        return
+
+    lines = []
+    for gid in force_join_channels:
+        title = force_join_group_titles.get(gid, gid)
+        username = force_join_group_usernames.get(gid, "")
+        link = force_join_links.get(gid, "") or "No link set"
+        display = f"{title} ({username})" if username else title
+        try:
+            chat = await context.bot.get_chat(gid)
+            status_text = "✅ reachable"
+        except Exception as e:
+            status_text = f"⚠️ not reachable ({type(e).__name__})"
+        lines.append(f"• {display}\n   {status_text}\n   🆔 `{gid}`\n   🔗 {link}")
+
+    await reply(
+        update,
+        "📊 *Force Join Status*\n\n"
+        f"Status: {'✅ Enabled' if force_join else '❌ Disabled (groups saved but force join is OFF)'}\n"
+        f"Required groups: `{len(force_join_channels)}`\n\n"
+        + "\n".join(lines)
+    )
+
+
+async def forcejoinon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global force_join
+    if not force_join_channels:
+        await reply(update, "❌ No groups configured. Add one with `/addforcejointhisgroup` first.")
+        return
+    force_join = True
+    save_all()
+    await reply(update, f"🟢 *Force Join Enabled*\n\nRequired groups: `{len(force_join_channels)}`")
+
+
+async def forcejoinoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global force_join
+    force_join = False
+    save_all()
+    await reply(update, "🔴 *Force Join Disabled*\n\nSaved groups are kept. Re-enable with `/forcejoinon`.")
+
+
+async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verify the user has joined ALL required force-join channels.
+
+    Never crashes the bot — every Telegram call is wrapped in try/except,
+    and 'Message is not modified' is safely ignored.
+    """
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception as e:
+        print(f"⚠️ verify_join_callback: query.answer() failed: {e}", flush=True)
+        return
+
+    user_id = query.from_user.id
+
+    # Admins always bypass force join
+    if is_admin(user_id):
+        await safe_edit_message(query, "✅ Admin verified. You can use the bot now.")
+        return
+
+    # If force join is disabled or no channels configured, allow access
+    if not force_join or not force_join_channels:
+        await safe_edit_message(query, "✅ Force join is disabled. You can use the bot now.")
+        return
+
+    # Always check real membership in EVERY channel. Never trust the click.
+    try:
+        missing = await get_missing_channels(context, user_id)
+    except Exception as e:
+        print(f"❌ verify_join_callback: get_missing_channels failed: {e}", flush=True)
+        missing = list(force_join_channels)  # treat all as missing on error
+
+    if not missing:
+        # User joined every required channel
+        await safe_edit_message(
+            query,
+            "✅ *Verification Successful!*\n\n"
+            "You can now use the bot.\n"
+            "Send /start or /like to continue.",
+        )
+        return
+
+    # Verification failed — show only the groups NOT yet joined
+    missing_lines = "\n".join(
+        f"• {_md_escape(_force_join_title(ch))}" for ch in missing
+    )
+    n = len(missing)
+    await safe_edit_message(
+        query,
+        "❌ *Verification Failed*\n\n"
+        f"You still need to join {n} group{'s' if n != 1 else ''}:\n"
+        f"{missing_lines}\n\n"
+        "Join the group(s) above, then tap ✅ I'VE JOINED - VERIFY again.",
+        reply_markup=build_force_join_keyboard(missing),
+    )
+
+
+async def forcejoin_noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer("No invite link is configured for this channel. Ask an admin.", show_alert=True)
+    except Exception as e:
+        print(f"⚠️ forcejoin_noop_callback: {e}", flush=True)
+
+
+# ============ LIKE MODE COMMANDS ============
+async def set_api_100(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """100-token mode (~100-110 likes per request)."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global like_tokens
+    like_tokens = 100
+    save_all()
+    await reply(update,
+                "✅ *API 100 mode ON*\n\n"
+                "🔢 Tokens per request: `100`\n"
+                "❤️ Expected likes: `~100-110`\n\n"
+                "Now send `/like BD UID`")
+
+
+async def set_api_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """MAX mode (400 tokens per request)."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    global like_tokens
+    like_tokens = 400
+    save_all()
+    await reply(update,
+                "✅ *MAX FF mode ON*\n\n"
+                "🔢 Tokens per request: `400`\n"
+                "❤️ Likes: as many as the 400 tokens can give\n\n"
+                "Now send `/like BD UID`")
+
+
+async def set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set custom token count per request."""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await reply(update, "❌ Usage: `/setapi <number>`\nExample: `/setapi 111`\nMax: 400")
+        return
+    global like_tokens
+    tokens = int(context.args[0])
+    if tokens < 10:
+        tokens = 10
+    elif tokens > 400:
+        tokens = 400
+    like_tokens = tokens
+    save_all()
+    await reply(update,
+                f"✅ *API Custom Mode ON*\n\n"
+                f"🔢 Tokens per request: `{tokens}`\n"
+                f"❤️ Expected likes: ~{tokens}\n\n"
+                f"Now send `/like BD UID`")
+
+
+# ============ AUTO LIKE COMMANDS ============
+
+async def autolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a new auto like task: /autolike REGION UID TOTAL_LIKES"""
+    if not await force_join_check(update, context): return
+    if not is_admin(update.effective_user.id):
+        await reply(update, "❌ Admin only!")
+        return
+    if not context.args or len(context.args) < 3:
+        await reply(
+            update,
+            "❌ Usage: `/autolike REGION UID TOTAL_LIKES`\n"
+            "Example: `/autolike BD 5933029554 30000`"
+        )
+        return
+
+    user_id = update.effective_user.id
+    user = update.effective_user
+    region = context.args[0].upper()
+    uid_str = context.args[1]
+    total_str = context.args[2]
+
+    # Validate UID
+    if not uid_str.isdigit():
+        await reply(update, "❌ UID must contain only numbers!")
+        return
+
+    uid = int(uid_str)
+
+    # Validate total likes
+    try:
+        total_likes = int(total_str)
+    except ValueError:
+        await reply(update, "❌ Invalid token count!")
+        return
+
+    if total_likes < 1:
+        await reply(update, "❌ Total likes must be at least 1!")
+        return
+
+    if total_likes > MAX_AUTO_LIKE_TARGET:
+        await reply(update, f"❌ Maximum target is {MAX_AUTO_LIKE_TARGET:,} likes!")
+        return
+
+    # Check for duplicate active task
+    existing = get_auto_like_task_by_uid(user_id, uid)
+    if existing and existing.get('status') in ('scheduled', 'running'):
+        await reply(
+            update,
+            f"❌ You already have an active auto like task for UID `{uid}`!\n"
+            f"Use `/stopautolike {uid}` to stop it first."
+        )
+        return
+
+    # Calculate next execution time (next 4:01 AM BD time)
+    now_bd = datetime.now(BD_TZ)
+    next_exec = now_bd.replace(hour=4, minute=1, second=0, microsecond=0)
+    if next_exec <= now_bd:
+        next_exec = next_exec + __import__('datetime').timedelta(days=1)
+
+    task_id = upsert_auto_like_task(
+        owner_id=user_id,
+        owner_username=user.username or "",
+        owner_name=user.first_name or "",
+        uid=uid,
+        region=region,
+        target_likes=total_likes,
+        status='scheduled',
+        next_execution=next_exec.isoformat()
+    )
+
+    await reply(
+        update,
+        "🔥 *AUTO LIKE ACTIVATED*\n\n"
+        f"👤 UID: `{uid}`\n"
+        f"🌍 Region: {region}\n"
+        f"🎯 Target: {total_likes:,} Likes\n"
+        f"⏰ Schedule: Daily 04:01 AM\n"
+        f"🇧🇩 Timezone: Bangladesh\n"
+        f"🟢 Status: SCHEDULED"
+    )
+
+    # Announce to channel/group
+    task = get_auto_like_task(task_id)
+    if task:
+        await announce_auto_like_created(task, context.bot)
+
+
+async def myautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show my auto like tasks: /myautolike"""
+    if not await force_join_check(update, context): return
+    user_id = update.effective_user.id
+    tasks = get_auto_like_tasks(owner_id=user_id)
+
+    if not tasks:
+        await reply(
+            update,
+            "📭 No auto like tasks found.\n"
+            "Create one with `/autolike REGION UID TOTAL_LIKES`"
+        )
+        return
+
+    msg = "📋 *MY AUTO LIKE TASKS*\n\n"
+    for t in tasks:
+        uid = t['uid']
+        region = t['region']
+        target = t['target_likes']
+        delivered = t.get('delivered_likes', 0) or 0
+        remaining = target - delivered
+        status = t.get('status', 'unknown')
+        status_emoji = {
+            'scheduled': '🟢', 'running': '🔄', 'completed': '✅',
+            'paused': '⏸️', 'failed': '❌', 'stopped': '🛑'
+        }.get(status, '⚪')
+
+        msg += (
+            f"{status_emoji} UID `{uid}` ({region})\n"
+            f"   {delivered:,}/{target:,} ({remaining:,} remaining)\n"
+            f"   Status: {status}\n\n"
+        )
+
+    await reply(update, msg)
+
+
+async def autolikeinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show task details: /autolikeinfo UID"""
+    if not await force_join_check(update, context): return
+    if not context.args or not context.args[0].isdigit():
+        await reply(update, "❌ Usage: `/autolikeinfo UID`")
+        return
+
+    user_id = update.effective_user.id
+    uid = int(context.args[0])
+
+    task = get_auto_like_task_by_uid(user_id, uid)
+    if not task:
+        await reply(update, f"❌ No auto like task found for UID `{uid}`")
+        return
+
+    target = task['target_likes']
+    delivered = task.get('delivered_likes', 0) or 0
+    remaining = target - delivered
+    pct = (delivered / target * 100) if target > 0 else 0
+    status = task.get('status', 'unknown')
+    next_exec = task.get('next_execution', 'Not set')
+    last_exec = task.get('last_executed', 'Never')
+
+    status_emoji = {
+        'scheduled': '🟢', 'running': '🔄', 'completed': '✅',
+        'paused': '⏸️', 'failed': '❌', 'stopped': '🛑'
+    }.get(status, '⚪')
+
+    await reply(
+        update,
+        "ℹ️ *AUTO LIKE INFO*\n\n"
+        f"👤 UID: `{uid}`\n"
+        f"🌍 Region: {task['region']}\n"
+        f"🎯 Target: {target:,} Likes\n"
+        f"❤️ Delivered: {delivered:,}\n"
+        f"📉 Remaining: {remaining:,}\n"
+        f"📊 Progress: {pct:.1f}%\n"
+        f"{status_emoji} Status: {status}\n"
+        f"⏰ Next: {next_exec}\n"
+        f"🕐 Last: {last_exec}"
+    )
+
+
+async def stopautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop an auto like task: /stopautolike UID"""
+    if not await force_join_check(update, context): return
+    if not context.args or not context.args[0].isdigit():
+        await reply(update, "❌ Usage: `/stopautolike UID`")
+        return
+
+    user_id = update.effective_user.id
+    uid = int(context.args[0])
+
+    task = get_auto_like_task_by_uid(user_id, uid)
+    if not task:
+        await reply(update, f"❌ No auto like task found for UID `{uid}`")
+        return
+
+    if task.get('status') in ('completed', 'stopped'):
+        await reply(
+            update,
+            f"⚠️ Task for UID `{uid}` is already {task.get('status')}."
+        )
+        return
+
+    set_auto_like_task_status(task['id'], 'stopped')
+    await reply(
+        update,
+        f"🛑 Auto like task for UID `{uid}` has been stopped."
+    )
+
+
+async def resumeautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resume a stopped task: /resumeautolike UID"""
+    if not await force_join_check(update, context): return
+    if not context.args or not context.args[0].isdigit():
+        await reply(update, "❌ Usage: `/resumeautolike UID`")
+        return
+
+    user_id = update.effective_user.id
+    uid = int(context.args[0])
+
+    task = get_auto_like_task_by_uid(user_id, uid)
+    if not task:
+        await reply(update, f"❌ No auto like task found for UID `{uid}`")
+        return
+
+    if task.get('status') == 'completed':
+        await reply(update, f"⚠️ Task for UID `{uid}` is already completed.")
+        return
+
+    # Calculate next execution
+    now_bd = datetime.now(BD_TZ)
+    next_exec = now_bd.replace(hour=4, minute=1, second=0, microsecond=0)
+    if next_exec <= now_bd:
+        next_exec = next_exec + __import__('datetime').timedelta(days=1)
+
+    # Actually update directly
+    with GROUP_DB_LOCK:
+        conn = sqlite3.connect(AUTO_LIKE_DB_FILE)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE auto_like_tasks SET status = 'scheduled', next_execution = ? WHERE owner_id = ? AND uid = ?",
+            (next_exec.isoformat(), user_id, uid)
+        )
+        conn.commit()
+        conn.close()
+
+    await reply(
+        update,
+        f"▶️ Auto like task for UID `{uid}` has been resumed."
+    )
+
+
+async def removeautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Permanently remove an auto like task: /removeautolike UID"""
+    if not await force_join_check(update, context): return
+    if not context.args or not context.args[0].isdigit():
+        await reply(update, "❌ Usage: `/removeautolike UID`")
+        return
+
+    user_id = update.effective_user.id
+    uid = int(context.args[0])
+
+    task = get_auto_like_task_by_uid(user_id, uid)
+    if not task:
+        await reply(update, f"❌ No auto like task found for UID `{uid}`")
+        return
+
+    deleted = delete_auto_like_task(task['id'])
+    if not deleted:
+        await reply(update, f"❌ Failed to remove task for UID `{uid}`")
+        return
+
+    await reply(
+        update,
+        f"🗑️ Auto like task for UID `{uid}` has been permanently removed."
+    )
+
+
+async def autolikestatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show global auto like status dashboard (admin only): /autolikestatus"""
+    if not await force_join_check(update, context): return
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await reply(update, "❌ Admin only!")
+        return
+
+    stats = get_auto_like_stats()
+    tasks = get_auto_like_tasks()
+
+    msg = (
+        "📊 *AUTO LIKE STATUS DASHBOARD*\n\n"
+        f"📦 Total Tasks: {stats['total']}\n"
+        f"🟢 Active: {stats['running'] + stats['scheduled']}\n"
+        f"✅ Completed: {stats['completed']}\n"
+        f"⏸️ Paused: {stats['paused']}\n"
+        f"❌ Failed: {stats['failed']}\n"
+        f"🛑 Stopped: {stats['stopped']}\n"
+        f"────────────────────\n"
+        f"🎯 Total Target: {stats['total_target']:,}\n"
+        f"❤️ Total Delivered: {stats['total_delivered']:,}\n"
+        f"📉 Total Remaining: {stats['total_remaining']:,}\n"
+    )
+
+    if tasks:
+        msg += "\n📋 *ALL TASKS:*\n"
+        for t in tasks:
+            uid = t['uid']
+            target = t['target_likes']
+            delivered = t.get('delivered_likes', 0) or 0
+            status = t.get('status', 'unknown')
+            status_emoji = {
+                'scheduled': '🟢', 'running': '🔄', 'completed': '✅',
+                'paused': '⏸️', 'failed': '❌', 'stopped': '🛑'
+            }.get(status, '⚪')
+            msg += f"{status_emoji} UID `{uid}` - {delivered:,}/{target:,} ({status})\n"
+
+    await reply(update, msg)
+
+
+async def autolikelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all auto like tasks (admin only): /autolikelist"""
+    if not await force_join_check(update, context): return
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await reply(update, "❌ Admin only!")
+        return
+
+    tasks = get_auto_like_tasks()
+
+    if not tasks:
+        await reply(update, "📭 No auto like tasks found.")
+        return
+
+    msg = "📋 *ALL AUTO LIKE TASKS*\n\n"
+    for i, t in enumerate(tasks[:50], 1):
+        uid = t['uid']
+        owner = t.get('owner_name', 'Unknown')
+        target = t['target_likes']
+        delivered = t.get('delivered_likes', 0) or 0
+        remaining = target - delivered
+        status = t.get('status', 'unknown')
+        status_emoji = {
+            'scheduled': '🟢', 'running': '🔄', 'completed': '✅',
+            'paused': '⏸️', 'failed': '❌', 'stopped': '🛑'
+        }.get(status, '⚪')
+
+        msg += (
+            f"{i}. {status_emoji} UID `{uid}` - {owner}\n"
+            f"   {delivered:,}/{target:,} ({remaining:,} rem.) - {status}\n"
+        )
+
+    if len(tasks) > 50:
+        msg += f"\n... and {len(tasks) - 50} more tasks."
+
+    await reply(update, msg)
+
+
+async def auto_like_scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every minute and executes any task whose next_execution is due.
+
+    There is deliberately no clock gate: if the Render free instance was asleep
+    at 04:01, the task is still picked up as soon as the bot wakes (catch-up).
+    """
+    global AUTO_LIKE_SCHEDULER_RUNNING
+    AUTO_LIKE_SCHEDULER_RUNNING = True
+
+    try:
+        tasks = get_due_auto_like_tasks()
+        if not tasks:
+            return
+
+        print(f"⏰ Auto Like scheduler: {len(tasks)} task(s) due", flush=True)
+
+        # Make sure the API has usable JWTs before spending the run
+        await ensure_fresh_tokens()
+
+        for task in tasks:
+            # Claim atomically: a second instance / overlapping run skips it.
+            if not claim_auto_like_task(task['id']):
+                continue
+            try:
+                await execute_auto_like_task(task)
+            except Exception as e:
+                print(f"⚠️ Auto like task {task.get('id')} crashed: {e}", flush=True)
+                reschedule_auto_like_after_failure(
+                    task['id'], task.get('retry_count', 0) or 0)
+
+    except Exception as e:
+        print(f"⚠️ Auto like scheduler tick error: {e}", flush=True)
+
+
+# ============ RENDER HEALTH SERVER (free web_service must bind $PORT) ============
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        # Silence default stderr logging to keep Render logs clean
+        return
+
+
+def start_health_server():
+    """Run a lightweight HTTP health server on $PORT in a daemon thread.
+    Required by Render free web_service (no Background Worker on free plan).
+    Telegram polling keeps running on the main thread via app.run_polling().
+    """
+    port = int(os.environ.get("PORT", "10000"))
+    for try_port in (port, 10000, 8080, 5000):
+        try:
+            server = HTTPServer(("0.0.0.0", try_port), _HealthHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            print(f"🌐 Health server listening on 0.0.0.0:{try_port}", flush=True)
+            return
+        except Exception as e:
+            print(f"⚠️ Health server port {try_port} failed: {e}", flush=True)
+            continue
+    print("❌ Health server could not bind to any port", flush=True)
+
+
+def start_keep_alive():
+    """Ping this service's public URL so Render's free tier does not sleep.
+
+    Render only counts *inbound* HTTP traffic as activity, and Telegram polling
+    is outbound, so without this the instance spins down after ~15 minutes and
+    both user commands and the 04:01 auto-like run are missed.
+    """
+    public_url = (
+        os.environ.get("RENDER_EXTERNAL_URL")
+        or os.environ.get("SERVICE_URL")
+        or ""
+    ).rstrip("/")
+    try:
+        interval = int(os.environ.get("KEEPALIVE_MINUTES", "10")) * 60
+    except Exception:
+        interval = 600
+
+    def _loop():
+        time.sleep(60)  # let the app finish booting
+        if not public_url:
+            print("💓 Keep-alive pinger disabled (set RENDER_EXTERNAL_URL)", flush=True)
+            return
+        while True:
+            try:
+                requests.get(f"{public_url}/health", timeout=30)
+            except Exception:
+                pass
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    print(f"💓 Keep-alive pinger started: {public_url}/health every {interval // 60} min", flush=True)
+
+
+# ============ MAIN ============
+def main():
+    global github_persistence
+    # Initialize GitHub persistence
+    github_persistence = init_github_persistence()
+    
+    # Start health server first so Render can reach us even if polling is down
+    try:
+        start_health_server()
+    except Exception as e:
+        print(f"❌ Health server failed: {e}", flush=True)
+
+    # Keep the free-tier instance awake (Telegram polling is outbound and
+    # does not count as Render activity on its own).
+    try:
+        start_keep_alive()
+    except Exception as e:
+        print(f"❌ Keep-alive failed: {e}", flush=True)
+
+    try:
+        load_data()
+    except Exception as e:
+        print(f"❌ load_data failed: {e}", flush=True)
+
+    # Initialize Auto Like scheduler database (function prints its own status)
+    try:
+        init_auto_like_db()
+        reset_stale_running_tasks()
+    except Exception as e:
+        print(f"⚠️ Auto Like DB init failed: {e}", flush=True)
+
+    # Initialize backup directory and verify database integrity on startup
+    try:
+        init_backup_dir()
+        ok, msg = verify_database_integrity()
+        print(f"💾 Backup dir initialized. DB Integrity: {'✅ OK' if ok else '❌ FAILED'} - {msg}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Backup/init check failed: {e}", flush=True)
+
+    # Build the Telegram application
+    try:
+        request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+        app = Application.builder().token(BOT_TOKEN).request(request).build()
+
+        job_queue = app.job_queue
+        if job_queue:
+            job_queue.run_daily(reset_midnight, time=datetime_time(hour=18, minute=0, second=0), days=tuple(range(7)))
+            print("⏰ Midnight reset scheduled", flush=True)
+
+            # Schedule auto like check every minute
+            job_queue.run_repeating(auto_like_scheduler_tick, interval=60, first=10)
+            print("⏰ Auto Like scheduler tick scheduled (every 60s)", flush=True)
+
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_cmd))
+        app.add_handler(CommandHandler("info", info_cmd))
+        app.add_handler(CommandHandler("like", like_cmd))
+        app.add_handler(CommandHandler("allow", allow_group))
+        app.add_handler(CommandHandler("off", off_cmd))
+        app.add_handler(CommandHandler("on", on_cmd))
+        app.add_handler(CommandHandler("stats", stats_cmd))
+        app.add_handler(CommandHandler("setprivate", set_private))
+        app.add_handler(CommandHandler("setpublic", set_public))
+        app.add_handler(CommandHandler("setlimit", set_limit))
+        # VIP user commands
+        app.add_handler(CommandHandler("addvip", addvip_cmd))
+        app.add_handler(CommandHandler("removevip", removevip_cmd))
+        app.add_handler(CommandHandler("vipstatus", vipstatus_cmd))
+        app.add_handler(CommandHandler("vipusers", vipusers_cmd))
+        app.add_handler(CommandHandler("viplimit", viplimit_cmd))
+        # New feature commands
+        app.add_handler(CommandHandler("likehistory", likehistory_cmd))
+        app.add_handler(CommandHandler("dailyreport", dailyreport_cmd))
+        app.add_handler(CommandHandler("setwelcome", setwelcome_cmd))
+        app.add_handler(CommandHandler("setgoodbye", setgoodbye_cmd))
+        app.add_handler(CommandHandler("setlang", setlang_cmd))
+        app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
+        # Auto-like announcement commands
+        app.add_handler(CommandHandler("setautolikechannel", setautolikechannel_cmd))
+        app.add_handler(CommandHandler("setautolikegroup", setautolikegroup_cmd))
+        app.add_handler(CommandHandler("autolikeannouncestatus", autolikeannouncestatus_cmd))
+        app.add_handler(CommandHandler("setapi100", set_api_100))
+        app.add_handler(CommandHandler("setapi", set_api))
+        app.add_handler(CommandHandler("setapimax", set_api_max))
+        app.add_handler(CommandHandler("maxff", set_api_max))
+        app.add_handler(CommandHandler("setforcejoin", setforcejoin))
+        app.add_handler(CommandHandler("addforcejoin", addforcejoin))
+        app.add_handler(CommandHandler("removeforcejoin", removeforcejoin))
+        app.add_handler(CommandHandler("forcejoinlist", forcejoinlist))
+        app.add_handler(CommandHandler("forcejoinstatus", forcejoinstatus))
+        app.add_handler(CommandHandler("forcejoinon", forcejoinon))
+        app.add_handler(CommandHandler("forcejoinoff", forcejoinoff))
+        app.add_handler(CommandHandler("addforcejointhisgroup", addforcejointhisgroup_cmd))
+        app.add_handler(CommandHandler("clearforcejoin", clearforcejoin_cmd))
+        app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+        app.add_handler(CommandHandler("registergroup", register_group_cmd))
+        app.add_handler(CommandHandler("apistatus", apistatus_cmd))
+        # Group Management commands
+        app.add_handler(CommandHandler("groups", groups_cmd))
+        app.add_handler(CommandHandler("allowgroup", allowgroup_cmd))
+        app.add_handler(CommandHandler("blockgroup", blockgroup_cmd))
+        app.add_handler(CommandHandler("syncgroups", syncgroups_cmd))
+        # Database backup commands
+        app.add_handler(CommandHandler("backup", backup_cmd))
+        app.add_handler(CommandHandler("backupstatus", backupstatus_cmd))
+        # Auto Like Scheduler commands
+        app.add_handler(CommandHandler("autolike", autolike_cmd))
+        app.add_handler(CommandHandler("myautolike", myautolike_cmd))
+        app.add_handler(CommandHandler("autolikeinfo", autolikeinfo_cmd))
+        app.add_handler(CommandHandler("stopautolike", stopautolike_cmd))
+        app.add_handler(CommandHandler("removeautolike", removeautolike_cmd))
+        app.add_handler(CommandHandler("resumeautolike", resumeautolike_cmd))
+        app.add_handler(CommandHandler("autolikestatus", autolikestatus_cmd))
+        app.add_handler(CommandHandler("autolikelist", autolikelist_cmd))
+        app.add_handler(CallbackQueryHandler(group_callback_handler, pattern="^(group_allow|group_block|group_details|groups_page)_"))
+        app.add_handler(CallbackQueryHandler(verify_join_callback, pattern="^verify_join$"))
+        app.add_handler(CallbackQueryHandler(forcejoin_noop_callback, pattern="^forcejoin_noop$"))
+        # Stick silences: stickers produce NO reply — not even "Admin only" / "No document".
+        # filters.Document.ALL matches only documents (never stickers).
+        app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        # Auto-register groups when bot is added; unregister when bot is removed/kicked.
+        app.add_handler(ChatMemberHandler(my_chat_member_handler, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
+        app.add_error_handler(error_handler)
+
+        # Set bot reference for announcements
+        set_app_bot(app)
+
+        print("🤖 Bot is running...", flush=True)
+        print("   → Normal users: only in groups, daily limit applies", flush=True)
+        print("   → Admin users: anywhere (DM + groups), unlimited likes", flush=True)
+
+        # Start polling — run_polling() manages its own event loop internally,
+        # including bot identity check (get_me) and webhook deletion.
+        # If polling crashes (network error, etc.), retry instead of dying.
+        print("🚀 Starting polling...", flush=True)
+        while True:
+            try:
+                app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            except Exception as e:
+                print(f"❌ Polling crashed: {e} — retrying in 10s", flush=True)
+                import traceback
+                traceback.print_exc()
+                time.sleep(10)
+                # Rebuild the application in case the old one is in a bad state
+                try:
+                    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+                    app = Application.builder().token(BOT_TOKEN).request(request).build()
+                    job_queue = app.job_queue
+                    if job_queue:
+                        job_queue.run_daily(reset_midnight, time=datetime_time(hour=18, minute=0, second=0), days=tuple(range(7)))
+                        job_queue.run_repeating(auto_like_scheduler_tick, interval=60, first=10)
+                    app.add_handler(CommandHandler("start", start))
+                    app.add_handler(CommandHandler("help", help_cmd))
+                    app.add_handler(CommandHandler("info", info_cmd))
+                    app.add_handler(CommandHandler("like", like_cmd))
+                    app.add_handler(CommandHandler("allow", allow_group))
+                    app.add_handler(CommandHandler("off", off_cmd))
+                    app.add_handler(CommandHandler("on", on_cmd))
+                    app.add_handler(CommandHandler("stats", stats_cmd))
+                    app.add_handler(CommandHandler("setprivate", set_private))
+                    app.add_handler(CommandHandler("setpublic", set_public))
+                    app.add_handler(CommandHandler("setlimit", set_limit))
+                    app.add_handler(CommandHandler("addvip", addvip_cmd))
+                    app.add_handler(CommandHandler("removevip", removevip_cmd))
+                    app.add_handler(CommandHandler("vipstatus", vipstatus_cmd))
+                    app.add_handler(CommandHandler("vipusers", vipusers_cmd))
+                    app.add_handler(CommandHandler("viplimit", viplimit_cmd))
+                    app.add_handler(CommandHandler("setautolikechannel", setautolikechannel_cmd))
+                    app.add_handler(CommandHandler("setautolikegroup", setautolikegroup_cmd))
+                    app.add_handler(CommandHandler("autolikeannouncestatus", autolikeannouncestatus_cmd))
+                    app.add_handler(CommandHandler("setapi100", set_api_100))
+                    app.add_handler(CommandHandler("setapi", set_api))
+                    app.add_handler(CommandHandler("setapimax", set_api_max))
+                    app.add_handler(CommandHandler("maxff", set_api_max))
+                    app.add_handler(CommandHandler("setforcejoin", setforcejoin))
+                    app.add_handler(CommandHandler("addforcejoin", addforcejoin))
+                    app.add_handler(CommandHandler("removeforcejoin", removeforcejoin))
+                    app.add_handler(CommandHandler("forcejoinlist", forcejoinlist))
+                    app.add_handler(CommandHandler("forcejoinstatus", forcejoinstatus))
+                    app.add_handler(CommandHandler("forcejoinon", forcejoinon))
+                    app.add_handler(CommandHandler("forcejoinoff", forcejoinoff))
+                    app.add_handler(CommandHandler("addforcejointhisgroup", addforcejointhisgroup_cmd))
+                    app.add_handler(CommandHandler("clearforcejoin", clearforcejoin_cmd))
+                    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+                    app.add_handler(CommandHandler("registergroup", register_group_cmd))
+                    app.add_handler(CommandHandler("apistatus", apistatus_cmd))
+                    app.add_handler(CommandHandler("groups", groups_cmd))
+                    app.add_handler(CommandHandler("allowgroup", allowgroup_cmd))
+                    app.add_handler(CommandHandler("blockgroup", blockgroup_cmd))
+                    app.add_handler(CommandHandler("syncgroups", syncgroups_cmd))
+                    app.add_handler(CommandHandler("backup", backup_cmd))
+                    app.add_handler(CommandHandler("backupstatus", backupstatus_cmd))
+                    app.add_handler(CommandHandler("autolike", autolike_cmd))
+                    app.add_handler(CommandHandler("myautolike", myautolike_cmd))
+                    app.add_handler(CommandHandler("autolikeinfo", autolikeinfo_cmd))
+                    app.add_handler(CommandHandler("stopautolike", stopautolike_cmd))
+                    app.add_handler(CommandHandler("removeautolike", removeautolike_cmd))
+                    app.add_handler(CommandHandler("resumeautolike", resumeautolike_cmd))
+                    app.add_handler(CommandHandler("autolikestatus", autolikestatus_cmd))
+                    app.add_handler(CommandHandler("autolikelist", autolikelist_cmd))
+                    app.add_handler(CallbackQueryHandler(group_callback_handler, pattern="^(group_allow|group_block|group_details|groups_page)_"))
+                    app.add_handler(CallbackQueryHandler(verify_join_callback, pattern="^verify_join$"))
+                    app.add_handler(CallbackQueryHandler(forcejoin_noop_callback, pattern="^forcejoin_noop$"))
+                    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+                    app.add_handler(ChatMemberHandler(my_chat_member_handler, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
+                    app.add_error_handler(error_handler)
+                    set_app_bot(app)
+                except Exception as rebuild_e:
+                    print(f"❌ Failed to rebuild app: {rebuild_e}", flush=True)
+                    time.sleep(10)
+    except Exception as e:
+        print(f"❌ Bot setup failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # Keep process alive so health server can still respond
+        while True:
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Dependencies & node_modules
+node_modules/
+api/node_modules/
+
+# Backups & temporary files
+*.bak*
+*.tmp
+api/*.bak*
+api/token_bd.json.bak.*
+
+# Bot local state & guest account passwords
+bot/allowed_groups.json
+bot/daily_stats.json
+bot/user_limits.json
+bot/bot_config.json
+bot/group_management.db
+bot/broadcast_list.json
+bot/successful_likes.json
+bot/backup_status.json
+data/guests/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & Test outputs
+*.log
+token_test_results.json
+api/test_tokens.py

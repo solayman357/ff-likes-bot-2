@@ -1,0 +1,35 @@
+services:
+  - type: web_service
+    name: ff-likes-api2
+    runtime: python
+    rootDirectory: api
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: API_KEY
+        sync: false
+    healthCheckPath: /health
+
+  - type: web_service
+    name: ff-likes-bot2
+    runtime: python
+    rootDirectory: bot
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: ENCODED_KEY
+        sync: false
+      - key: API_URL
+        fromService:
+          name: ff-likes-api2
+          type: web_service
+          property: url
+    healthCheckPath: /health
