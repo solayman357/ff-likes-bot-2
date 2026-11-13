@@ -1,18 +1,4 @@
 {
-  "chats": {
-    "-1003922567550": {
-      "chat_id": -1003922567550,
-      "chat_type": "supergroup",
-      "title": "⚡ 𝑭𝑹𝑬𝑬 𝑭𝑰𝑹𝑬 𝑳𝑰𝑲𝑬𝑺 ⚡",
-      "added_at": "2026-11-13"
-    }
-  },
-  "users": {
-    "7176002628": {
-      "user_id": 7176002628,
-      "username": "CATS_AI_solayman",
-      "first_name": "『𝑪𝑨𝑻𝑺 𝑨𝑰』『𝑺𝑶𝑳𝑨𝒀𝑴𝑨𝑵』🐱",
-      "added_at": "2026-11-13"
-    }
-  }
+  "chats": {},
+  "users": {}
 }
