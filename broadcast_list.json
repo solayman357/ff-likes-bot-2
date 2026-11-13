@@ -1,36 +1,4 @@
 {
-  "chats": {
-    "-1003910729190": {
-      "chat_id": -1003910729190,
-      "chat_type": "supergroup",
-      "title": "𝐒𝐀𝐌𝐈𝐑 𝐋𝐈𝐊𝐄",
-      "added_at": "2026-11-13"
-    },
-    "-1003951085541": {
-      "chat_id": -1003951085541,
-      "chat_type": "supergroup",
-      "title": "𓆩𝐅𝐅 𝐀𝐔𝐓𝐎𝐋𝐈𝐊𝐄𝐒 𝐏𝐑𝐎𓆪",
-      "added_at": "2026-11-13"
-    }
-  },
-  "users": {
-    "9248753326": {
-      "user_id": 9248753326,
-      "username": "",
-      "first_name": "𝐒𝐀𝐌𝐈𝐑",
-      "added_at": "2026-11-13"
-    },
-    "8563650155": {
-      "user_id": 8563650155,
-      "username": "",
-      "first_name": "𝐒𝐀𝐌𝐈𝐑",
-      "added_at": "2026-11-13"
-    },
-    "7250954125": {
-      "user_id": 7250954125,
-      "username": "",
-      "first_name": "SAMIR//",
-      "added_at": "2026-11-13"
-    }
-  }
+  "chats": {},
+  "users": {}
 }
