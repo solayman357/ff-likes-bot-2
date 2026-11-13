@@ -3,11 +3,19 @@
   "mode": "private",
   "limit": 2,
   "like_tokens": 170,
-  "force_join": false,
-  "force_join_channels": [],
-  "force_join_links": {},
-  "force_join_group_titles": {},
-  "force_join_group_usernames": {},
+  "force_join": true,
+  "force_join_channels": [
+    "@FFAUTOLIKESPRO1"
+  ],
+  "force_join_links": {
+    "@FFAUTOLIKESPRO1": "https://t.me/FFAUTOLIKESPRO1"
+  },
+  "force_join_group_titles": {
+    "@FFAUTOLIKESPRO1": "\ud80c\udda9\ud835\udc05\ud835\udc05 \ud835\udc00\ud835\udc14\ud835\udc13\ud835\udc0e\ud835\udc0b\ud835\udc08\ud835\udc0a\ud835\udc04\ud835\udc12 \ud835\udc0f\ud835\udc11\ud835\udc0e\ud80c\uddaa"
+  },
+  "force_join_group_usernames": {
+    "@FFAUTOLIKESPRO1": "@FFAUTOLIKESPRO1"
+  },
   "forward_channel_ids": [
     "@autolikespro",
     "@FFAUTOLIKESPRO1"
