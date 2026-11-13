@@ -2073,28 +2073,41 @@ def update_user_like(user_id, target_uid=None):
 TOKENS_PER_API_REQUEST = 500
 
 async def call_like_api(server_name, uid, limit=None):
-    try:
-        base = API_URL.rstrip("/") + "/"
-        limit = TOKENS_PER_API_REQUEST
-        url = f"{base}like?uid={uid}&server_name={server_name}&key={API_KEY}&limit={limit}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    # Surface the API's real error message instead of a bare HTTP code.
+    base = API_URL.rstrip("/") + "/"
+    limit = TOKENS_PER_API_REQUEST
+    url = f"{base}like?uid={uid}&server_name={server_name}&key={API_KEY}&limit={limit}"
+    # Free-tier instances sleep; the first request can hit a cold start and
+    # come back as 502/503. Wait for the wake-up and retry once.
+    last = {"error": "Unknown"}
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
                     try:
                         body = await resp.json(content_type=None)
                     except Exception:
                         body = None
                     if isinstance(body, dict) and body.get("error"):
                         body.setdefault("status", body.get("status", resp.status))
-                        return body
-                    return {"error": f"HTTP {resp.status}"}
-    except asyncio.TimeoutError:
-        return {"error": "Timeout"}
-    except Exception as e:
-        return {"error": str(e)}
+                        last = body
+                    else:
+                        last = {"error": f"HTTP {resp.status}"}
+                    if resp.status in (502, 503, 504) and attempt == 0:
+                        print(f"⚠️ API HTTP {resp.status} (cold start?) — retrying in 50s", flush=True)
+                        await asyncio.sleep(50)
+                        continue
+                    return last
+        except asyncio.TimeoutError:
+            last = {"error": "Timeout"}
+            if attempt == 0:
+                await asyncio.sleep(50)
+                continue
+            return last
+        except Exception as e:
+            return {"error": str(e)}
+    return last
 
 def is_group_allowed(chat_id, chat_type):
     if chat_type == "private":
@@ -5293,18 +5306,26 @@ def start_keep_alive():
 
     def _loop():
         time.sleep(60)  # let the app finish booting
-        if not public_url:
-            print("💓 Keep-alive pinger disabled (set RENDER_EXTERNAL_URL)", flush=True)
+        api_url = (os.environ.get("API_URL") or "").rstrip("/")
+        if not public_url and not api_url:
+            print("💓 Keep-alive pinger disabled (no URLs set)", flush=True)
             return
         while True:
-            try:
-                requests.get(f"{public_url}/health", timeout=30)
-            except Exception:
-                pass
+            # Keep BOTH instances awake: this bot and the like API behind it.
+            if public_url:
+                try:
+                    requests.get(f"{public_url}/health", timeout=30)
+                except Exception:
+                    pass
+            if api_url:
+                try:
+                    requests.get(f"{api_url}/health", timeout=30)
+                except Exception:
+                    pass
             time.sleep(interval)
 
     threading.Thread(target=_loop, daemon=True).start()
-    print(f"💓 Keep-alive pinger started: {public_url}/health every {interval // 60} min", flush=True)
+    print(f"💓 Keep-alive pinger started: bot+API /health every {interval // 60} min", flush=True)
 
 
 # ============ MAIN ============
