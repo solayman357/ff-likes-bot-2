@@ -1841,6 +1841,8 @@ async def _migrate_force_join_ids(context: ContextTypes.DEFAULT_TYPE):
 
 async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Block access until the user has joined ALL required channels."""
+    if bot_status == "off":
+        return True
     if not force_join or not force_join_channels:
         return True
     user = update.effective_user
