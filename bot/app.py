@@ -1015,7 +1015,7 @@ async def execute_auto_like_task(task):
 
     # Determine how many tokens to request this time
     # Cap at remaining to avoid exceeding target
-    tokens_to_request = min(remaining, 400)  # Max 400 per API request
+    tokens_to_request = min(remaining, 10000)  # Max 400 per API request
 
     try:
         # Call the existing like API
@@ -2227,8 +2227,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "🔒 `/setprivate` / `/setpublic` — Group mode\n"
         msg += "📋 `/setlimit <num>` — Daily like limit\n"
         msg += "🔢 `/setapi100` — 100 tokens mode\n"
-        msg += "🔢 `/setapi <num>` — Custom tokens (10–400)\n"
-        msg += "🚀 `/setapimax` or `/maxff` — 400 tokens max\n"
+        msg += "🔢 `/setapi <num>` — Custom tokens (10–10000)\n"
+        msg += "🚀 `/setapimax` or `/maxff` — 10000 tokens max\n"
         msg += "\n"
         msg += "🔗 *Force-Join:*\n"
         msg += "   `/addforcejointhisgroup` — Add current group/channel\n"
@@ -3014,7 +3014,7 @@ async def apistatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_like_tokens = like_tokens
 
         # Determine mode name based on current like_tokens setting
-        if current_like_tokens == 400:
+        if current_like_tokens == 10000:
             mode_name = "MAX FF Mode"
         elif current_like_tokens == 100:
             mode_name = "100 Token Mode"
@@ -4842,18 +4842,18 @@ async def set_api_100(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_api_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """MAX mode (400 tokens per request)."""
+    """MAX mode (10000 tokens per request)."""
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
         return
     global like_tokens
-    like_tokens = 400
+    like_tokens = 10000
     save_all()
     await reply(update,
                 "✅ *MAX FF mode ON*\n\n"
-                "🔢 Tokens per request: `400`\n"
-                "❤️ Likes: as many as the 400 tokens can give\n\n"
+                "🔢 Tokens per request: `10000`\n"
+                "❤️ Likes: as many as the 10000 tokens can give\n\n"
                 "Now send `/like BD UID`")
 
 
@@ -4864,14 +4864,14 @@ async def set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, "❌ Admin only")
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
-        await reply(update, "❌ Usage: `/setapi <number>`\nExample: `/setapi 111`\nMax: 400")
+        await reply(update, "❌ Usage: `/setapi <number>`\nExample: `/setapi 111`\nMax: 10000")
         return
     global like_tokens
     tokens = int(context.args[0])
     if tokens < 10:
         tokens = 10
-    elif tokens > 400:
-        tokens = 400
+    elif tokens > 10000:
+        tokens = 10000
     like_tokens = tokens
     save_all()
     await reply(update,
