@@ -2081,7 +2081,6 @@ async def call_like_api(server_name, uid, limit=None):
     try:
         limit = max(10, min(10000, int(limit if limit else like_tokens)))
     except Exception:
-        limit = like_tokens
     url = f"{base}like?uid={uid}&server_name={server_name}&key={API_KEY}&limit={limit}"
     # Free-tier instances sleep; the first request can hit a cold start and
     # come back as 502/503. Wait for the wake-up and retry once.
