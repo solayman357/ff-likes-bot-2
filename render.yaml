@@ -2,6 +2,7 @@ services:
   - type: web_service
     name: ff-likes-api2
     runtime: python
+    plan: free
     rootDirectory: api
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
@@ -15,6 +16,7 @@ services:
   - type: web_service
     name: ff-likes-bot2
     runtime: python
+    plan: free
     rootDirectory: bot
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
@@ -27,6 +29,12 @@ services:
         sync: false
       - key: ENCODED_KEY
         sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        value: solayman357/ff-likes-bot-2
+      - key: GITHUB_DATA_BRANCH
+        value: bot-data
       - key: API_URL
         fromService:
           name: ff-likes-api2

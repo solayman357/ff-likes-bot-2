@@ -39,6 +39,7 @@ LIKE_LIMIT_MARKER = b"DAILY_LIKE_PROFILE_LIMIT"
 LIKE_LIMIT_BACKOFF = 1.5          # seconds (doubles each retry)
 LIKE_SEND_CHUNK = 100             # accounts per burst
 LIKE_SEND_CHUNK_DELAY = 0.4       # pause between bursts
+LIKE_RETRY_ROUNDS = 4            # extra passes for accounts that failed
 TOKEN_FILES = ["token_bd_1.json", "token_bd_2.json"]
 ACCOUNT_JSON_SOURCES = ["accounts20_part2.json", "sol.lost_account.json"]
 
@@ -755,17 +756,35 @@ def handle_requests():
         # Send in small bursts with a short pause between them. One giant
         # parallel burst makes many accounts hit Garena's like throttle at the
         # same moment; spacing them out keeps the success rate high.
-        results = []
-        for i in range(0, len(selected), LIKE_SEND_CHUNK):
-            chunk = selected[i:i + LIKE_SEND_CHUNK]
-            tasks = [
-                send_single_like_request(enc_like_payload, td, like_url)
-                for (_f, td, _u) in chunk
-            ]
-            results.extend(await asyncio.gather(*tasks, return_exceptions=True))
-            if i + LIKE_SEND_CHUNK < len(selected):
-                await asyncio.sleep(LIKE_SEND_CHUNK_DELAY)
-        return results
+        # Failed sends are retried in later rounds so a request stays full.
+        results = {}
+        pending = list(range(len(selected)))
+        for round_no in range(LIKE_RETRY_ROUNDS):
+            if not pending:
+                break
+            round_results = {}
+            for i in range(0, len(pending), LIKE_SEND_CHUNK):
+                idxs = pending[i:i + LIKE_SEND_CHUNK]
+                chunk = [selected[j] for j in idxs]
+                tasks = [
+                    send_single_like_request(enc_like_payload, td, like_url)
+                    for (_f, td, _u) in chunk
+                ]
+                chunk_res = await asyncio.gather(*tasks, return_exceptions=True)
+                for j, r in zip(idxs, chunk_res):
+                    round_results[j] = r
+                if i + LIKE_SEND_CHUNK < len(pending):
+                    await asyncio.sleep(LIKE_SEND_CHUNK_DELAY)
+            still_failed = []
+            for j in pending:
+                r = round_results.get(j)
+                results[j] = r
+                if not (isinstance(r, int) and r == 200):
+                    still_failed.append(j)
+            pending = still_failed
+            if pending and round_no < LIKE_RETRY_ROUNDS - 1:
+                await asyncio.sleep(LIKE_SEND_CHUNK_DELAY * 2)
+        return [results.get(i) for i in range(len(selected))]
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

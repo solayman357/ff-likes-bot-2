@@ -874,6 +874,12 @@ async def send_auto_like_report(region: str, uid, nickname: str,
     Uses your exact stylized format with HTML parse mode + plain-text fallback
     so reports never fail, even if Garena nicknames contain special characters.
     """
+    # Failed runs are NOT posted to the auto-like group/channel — only success
+    # reports are published there. Failures stay in the log/history only.
+    if not success:
+        print("ℹ️ Auto-like failed run — report skipped (success-only channel)", flush=True)
+        return
+
     bot = bot_instance or app_bot_instance
     if bot is None:
         print("⚠️ Auto-like report: bot instance not available", flush=True)
@@ -2063,12 +2069,14 @@ def update_user_like(user_id, target_uid=None):
     daily_stats[t]['users'][suid] += 1
     save_all()
 
+# Every like request must ask the API for exactly this many tokens.
+TOKENS_PER_API_REQUEST = 500
+
 async def call_like_api(server_name, uid, limit=None):
     try:
         base = API_URL.rstrip("/") + "/"
-        url = f"{base}like?uid={uid}&server_name={server_name}&key={API_KEY}"
-        if limit:
-            url += f"&limit={int(limit)}"
+        limit = TOKENS_PER_API_REQUEST
+        url = f"{base}like?uid={uid}&server_name={server_name}&key={API_KEY}&limit={limit}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                 if resp.status == 200:
