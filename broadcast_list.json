@@ -1,11 +1,4 @@
 {
-  "chats": {
-    "-1003910729190": {
-      "chat_id": -1003910729190,
-      "chat_type": "supergroup",
-      "title": "𝐒𝐀𝐌𝐈𝐑 𝐋𝐈𝐊𝐄",
-      "added_at": "2026-11-13"
-    }
-  },
+  "chats": {},
   "users": {}
 }
