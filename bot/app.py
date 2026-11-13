@@ -2074,7 +2074,12 @@ TOKENS_PER_API_REQUEST = 500
 
 async def call_like_api(server_name, uid, limit=None):
     base = API_URL.rstrip("/") + "/"
-    limit = TOKENS_PER_API_REQUEST
+    # Per-bot request size: whatever /setapi set (like_tokens), passed by the
+    # caller. Falls back to like_tokens if no explicit limit was given.
+    try:
+        limit = max(10, min(500, int(limit if limit else like_tokens)))
+    except Exception:
+        limit = like_tokens
     url = f"{base}like?uid={uid}&server_name={server_name}&key={API_KEY}&limit={limit}"
     # Free-tier instances sleep; the first request can hit a cold start and
     # come back as 502/503. Wait for the wake-up and retry once.
