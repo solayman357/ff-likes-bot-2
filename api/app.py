@@ -37,7 +37,7 @@ LIKES_PER_USER_REQUEST = 400
 # like-profile throttle. It clears after a short wait, so these must be retried.
 LIKE_LIMIT_MARKER = b"DAILY_LIKE_PROFILE_LIMIT"
 LIKE_LIMIT_BACKOFF = 1.5          # seconds (doubles each retry)
-LIKE_SEND_CHUNK = 100             # accounts per burst
+LIKE_SEND_CHUNK = 300             # accounts per burst
 LIKE_SEND_CHUNK_DELAY = 0.4       # pause between bursts
 LIKE_RETRY_ROUNDS = 4            # extra passes for accounts that failed
 TOKEN_FILES = ["token_bd_1.json", "token_bd_2.json"]
