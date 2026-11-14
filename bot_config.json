@@ -2,7 +2,7 @@
   "status": "on",
   "mode": "public",
   "limit": 1,
-  "like_tokens": 600,
+  "like_tokens": 10000,
   "force_join": true,
   "force_join_channels": [
     "-1003922567550",
