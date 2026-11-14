@@ -5457,6 +5457,18 @@ def start_keep_alive():
 
 # ============ MAIN ============
 def main():
+    # PTB's run_polling() calls asyncio.get_event_loop(), which on Python 3.14
+    # returns the current loop even when it is CLOSED (a loop left closed by a
+    # previous run_polling()). That makes every attempt fail with "Event loop
+    # is closed" and the bot crash-loops forever, wiping persisted settings.
+    # Install a fresh, OPEN loop before the app is built so that the job queue
+    # and PTB both bind to the same loop.
+    try:
+        _cur_loop = asyncio.get_event_loop_policy().get_event_loop()
+    except Exception:
+        _cur_loop = None
+    if _cur_loop is None or _cur_loop.is_closed():
+        asyncio.set_event_loop(asyncio.new_event_loop())
     global github_persistence
     # Initialize GitHub persistence
     github_persistence = init_github_persistence()
