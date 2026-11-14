@@ -1872,6 +1872,14 @@ async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 def is_admin(uid): return uid in ADMIN_IDS
+
+
+async def check_bot_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Silent-mode gate. Returns False (and sends NOTHING) when the bot is OFF."""
+    if bot_status == "off":
+        return False
+    return True
+
 def is_vip(uid): return uid in vip_users
 
 
@@ -2081,6 +2089,7 @@ async def call_like_api(server_name, uid, limit=None):
     try:
         limit = max(10, min(10000, int(limit if limit else like_tokens)))
     except Exception:
+        limit = like_tokens
     url = f"{base}like?uid={uid}&server_name={server_name}&key={API_KEY}&limit={limit}"
     # Free-tier instances sleep; the first request can hit a cold start and
     # come back as 502/503. Wait for the wake-up and retry once.
@@ -2153,6 +2162,8 @@ async def reply(update, text):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log errors and notify user with actual error details."""
+    if bot_status == "off":
+        return  # Bot OFF: stay silent, no error messages
     import traceback
     err = context.error
     print(f"Exception while handling update: {err}", flush=True)
@@ -2170,15 +2181,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ============ USER COMMANDS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
-    if not await force_join_check(update, context): return
-    if bot_status == "off":
-        await reply(update, "🔴 Bot is currently OFF")
+    if not await check_bot_on(update, context):
         return
+    if not await force_join_check(update, context): return
     # Register this chat for broadcasts (users + groups)
     register_chat(update)
     await reply(update, welcome_msg)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if bot_status == "off":
         await reply(update, "🔴 Bot is OFF")
@@ -2289,6 +2301,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, msg)
 
 async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if bot_status == "off":
         await reply(update, "🔴 Bot is OFF")
@@ -2466,11 +2480,10 @@ async def _run_like_progress_animation(proc_msg, uid: str, region: str, stop_eve
 
 async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /like REGION UID command."""
+    if not await check_bot_on(update, context):
+        return
     if await block_non_admin_private(update): return
     if not await force_join_check(update, context):
-        return
-    if bot_status == "off":
-        await reply(update, "🔴 Bot is currently OFF")
         return
     register_chat(update)
 
@@ -2833,6 +2846,8 @@ async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_T
     sends a command. Also removes groups from broadcast when the bot leaves
     or is kicked.
     """
+    if not await check_bot_on(update, context):
+        return
     try:
         chat = update.effective_chat
         if chat is None:
@@ -2921,6 +2936,8 @@ async def register_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     Usage: /registergroup              (registers current group)
            /registergroup <CHAT_ID>    (registers a group by its chat ID)
     """
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -2975,6 +2992,8 @@ async def register_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def apistatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show API token status. Admin only. Reads from the API's /token_info endpoint."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3055,6 +3074,8 @@ async def apistatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all groups with pagination and ALLOW/BLOCK/DETAILS buttons. Admin only."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3150,6 +3171,8 @@ async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def allowgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allow a group by chat ID. Admin only."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3175,6 +3198,8 @@ async def allowgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def blockgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Block a group by chat ID. Admin only."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3204,6 +3229,8 @@ async def syncgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Also attempts to fetch fresh chat info via get_chat() for each registered
     broadcast chat so titles and usernames stay up to date.
     """
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3344,6 +3371,8 @@ def create_backup():
 
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Create a database backup. Admin only."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3370,6 +3399,8 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def backupstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show backup status. Admin only."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3392,6 +3423,8 @@ async def backupstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def group_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline button callbacks for group management."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     query = update.callback_query
     await query.answer()
@@ -3613,6 +3646,8 @@ def log_successful_like(uid, region, likes_given, before, after, user_id):
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only command")
         return
@@ -3662,6 +3697,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast an exact message to every registered user and group. Admin only."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3749,6 +3786,8 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ ADMIN COMMANDS ============
 async def allow_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ *Admin only command*")
@@ -3781,6 +3820,8 @@ async def on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, "🟢 *Bot is now ON*")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context):
         return
     if not is_admin(update.effective_user.id):
@@ -3803,6 +3844,8 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, msg)
 
 async def set_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3813,6 +3856,8 @@ async def set_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, "🔒 *Bot is now PRIVATE* – works only in allowed groups")
 
 async def set_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3823,6 +3868,8 @@ async def set_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, "🌍 *Bot is now PUBLIC* – works in all groups")
 
 async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3839,6 +3886,8 @@ async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ VIP USER COMMANDS ============
 async def addvip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a VIP user (unlimited likes, private access): /addvip <user_id>"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3854,6 +3903,8 @@ async def addvip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def removevip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove a VIP user: /removevip <user_id>"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3869,6 +3920,8 @@ async def removevip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def vipstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check your VIP status: /vipstatus"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     uid = update.effective_user.id
     if is_vip(uid):
@@ -3890,6 +3943,8 @@ async def vipstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def vipusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all VIP users (admin only): /vipusers"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -3919,6 +3974,8 @@ async def viplimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /viplimit reset <user_id>     -> remove override, back to default
     /viplimit resetall            -> clear every override
     """
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -4028,6 +4085,8 @@ async def viplimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ LIKE HISTORY COMMAND ============
 async def likehistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View your like history: /likehistory [UID]"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     user_id = update.effective_user.id
     target_uid = None
@@ -4064,6 +4123,8 @@ async def likehistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ DAILY REPORT COMMAND ============
 async def dailyreport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send daily report (admin only): /dailyreport"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -4094,6 +4155,8 @@ async def dailyreport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ WELCOME/GOODBYE COMMANDS ============
 async def setwelcome_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set custom welcome message (admin only): /setwelcome <text>"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     global welcome_msg
     if not is_admin(update.effective_user.id):
@@ -4109,6 +4172,8 @@ async def setwelcome_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setgoodbye_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set custom goodbye message (admin only): /setgoodbye <text>"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     global goodbye_msg
     if not is_admin(update.effective_user.id):
@@ -4125,6 +4190,8 @@ async def setgoodbye_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ LANGUAGE COMMAND ============
 async def setlang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set your language: /setlang en or /setlang bn"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     user_id = update.effective_user.id
     if not context.args or context.args[0].lower() not in ("en", "bn"):
@@ -4139,6 +4206,8 @@ async def setlang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ LEADERBOARD COMMAND ============
 async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View top users by likes today: /leaderboard"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     t = today_str()
     if t not in daily_stats or daily_stats[t]['total'] == 0:
@@ -4156,6 +4225,8 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ AUTO LIKE ANNOUNCEMENT COMMANDS ============
 async def setautolikechannel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set the channel for auto-like announcements: /setautolikechannel @channel"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -4171,6 +4242,8 @@ async def setautolikechannel_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
 async def setautolikegroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set the group for auto-like announcements: /setautolikegroup <group_id>"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -4191,6 +4264,8 @@ async def setautolikegroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def autolikeannouncestatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show auto-like announcement configuration: /autolikeannouncestatus"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -4585,16 +4660,22 @@ async def _add_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add the first/another required channel."""
+    if not await check_bot_on(update, context):
+        return
     await _add_force_join(update, context)
 
 
 async def addforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add another required channel (alias of /setforcejoin)."""
+    if not await check_bot_on(update, context):
+        return
     await _add_force_join(update, context)
 
 
 async def removeforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove one required group, or all of them."""
+    if not await check_bot_on(update, context):
+        return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
         return
@@ -4656,11 +4737,15 @@ async def removeforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addforcejointhisgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add current group/channel or by username to force-join list."""
+    if not await check_bot_on(update, context):
+        return
     await _add_force_join(update, context)
 
 
 async def clearforcejoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear all force-join groups after admin confirmation."""
+    if not await check_bot_on(update, context):
+        return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
         return
@@ -4685,6 +4770,8 @@ async def clearforcejoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def forcejoinlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
         return
@@ -4699,6 +4786,8 @@ async def forcejoinlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def forcejoinstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the real saved configuration and verify each group is reachable."""
+    if not await check_bot_on(update, context):
+        return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
         return
@@ -4736,6 +4825,8 @@ async def forcejoinstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def forcejoinon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
         return
@@ -4749,6 +4840,8 @@ async def forcejoinon(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def forcejoinoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
         return
@@ -4764,6 +4857,8 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     Never crashes the bot — every Telegram call is wrapped in try/except,
     and 'Message is not modified' is safely ignored.
     """
+    if not await check_bot_on(update, context):
+        return
     query = update.callback_query
     try:
         await query.answer()
@@ -4816,6 +4911,8 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def forcejoin_noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_bot_on(update, context):
+        return
     query = update.callback_query
     try:
         await query.answer("No invite link is configured for this channel. Ask an admin.", show_alert=True)
@@ -4826,6 +4923,8 @@ async def forcejoin_noop_callback(update: Update, context: ContextTypes.DEFAULT_
 # ============ LIKE MODE COMMANDS ============
 async def set_api_100(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """100-token mode (~100-110 likes per request)."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -4842,6 +4941,8 @@ async def set_api_100(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_api_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """MAX mode (10000 tokens per request)."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -4858,6 +4959,8 @@ async def set_api_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set custom token count per request."""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only")
@@ -4884,6 +4987,8 @@ async def set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def autolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Create a new auto like task: /autolike REGION UID TOTAL_LIKES"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not is_admin(update.effective_user.id):
         await reply(update, "❌ Admin only!")
@@ -4970,6 +5075,8 @@ async def autolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def myautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show my auto like tasks: /myautolike"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     user_id = update.effective_user.id
     tasks = get_auto_like_tasks(owner_id=user_id)
@@ -5006,6 +5113,8 @@ async def myautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def autolikeinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show task details: /autolikeinfo UID"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not context.args or not context.args[0].isdigit():
         await reply(update, "❌ Usage: `/autolikeinfo UID`")
@@ -5049,6 +5158,8 @@ async def autolikeinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stopautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop an auto like task: /stopautolike UID"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not context.args or not context.args[0].isdigit():
         await reply(update, "❌ Usage: `/stopautolike UID`")
@@ -5078,6 +5189,8 @@ async def stopautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def resumeautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Resume a stopped task: /resumeautolike UID"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not context.args or not context.args[0].isdigit():
         await reply(update, "❌ Usage: `/resumeautolike UID`")
@@ -5120,6 +5233,8 @@ async def resumeautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def removeautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Permanently remove an auto like task: /removeautolike UID"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     if not context.args or not context.args[0].isdigit():
         await reply(update, "❌ Usage: `/removeautolike UID`")
@@ -5146,6 +5261,8 @@ async def removeautolike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def autolikestatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show global auto like status dashboard (admin only): /autolikestatus"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -5187,6 +5304,8 @@ async def autolikestatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def autolikelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all auto like tasks (admin only): /autolikelist"""
+    if not await check_bot_on(update, context):
+        return
     if not await force_join_check(update, context): return
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -5229,6 +5348,8 @@ async def auto_like_scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
     There is deliberately no clock gate: if the Render free instance was asleep
     at 04:01, the task is still picked up as soon as the bot wakes (catch-up).
     """
+    if bot_status == "off":
+        return  # Bot OFF: no background like processing
     global AUTO_LIKE_SCHEDULER_RUNNING
     AUTO_LIKE_SCHEDULER_RUNNING = True
 
@@ -5477,6 +5598,13 @@ def main():
                 import traceback
                 traceback.print_exc()
                 time.sleep(10)
+                # PTB closes the event loop when polling exits. Reusing that
+                # closed loop makes every retry fail with "Event loop is
+                # closed", so the bot crash-loops and never persists state.
+                try:
+                    asyncio.set_event_loop(asyncio.new_event_loop())
+                except Exception:
+                    pass
                 # Rebuild the application in case the old one is in a bad state
                 try:
                     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
