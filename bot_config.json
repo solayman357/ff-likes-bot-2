@@ -2,7 +2,7 @@
   "status": "off",
   "mode": "private",
   "limit": 1,
-  "like_tokens": 250,
+  "like_tokens": 350,
   "force_join": true,
   "force_join_channels": [
     "@FFAUTOLIKESPRO1",
